@@ -58,59 +58,183 @@ EPS = 1e-12
 EAR_DIST = 0.18           # ~18 cm ear spacing
 SPEED_SOUND = 343.0
 
-# Bands (Warzone-tuned)
-FOOT_A = (60, 250)        # impact / heel
-FOOT_B = (1000, 4000)     # tread / scrape (often mixed hotter)
-GUN_1  = (300, 1200)
-GUN_2  = (1200, 5000)
+# Bands (Warzone/COD tuned - more specific isolation)
+# Footsteps: COD footsteps have energy primarily in low-mid frequencies
+FOOT_LOW = (40, 180)      # heel impact, bass thump of steps
+FOOT_MID = (250, 800)     # body of footstep sound
+FOOT_HIGH = (2000, 4500)  # surface texture (gravel, metal, etc.)
 
-# Confidence / thresholds
-TH_K_FA = 3.0
-TH_K_FB = 2.5
-TH_K_G  = 3.5
-CREST_SHOT = 8.0
+# Gunfire: Much broader spectrum, higher energy, different characteristics
+GUN_LOW = (80, 400)       # gunshot bass/thump
+GUN_MID = (400, 2000)     # main gunfire body
+GUN_HIGH = (2000, 8000)   # gunfire crack/report
 
-# Cadence (seconds between steps)
-CAD_MIN = 0.12
-CAD_MAX = 0.45
+# Detection thresholds (higher = less sensitive, fewer false positives)
+TH_K_FOOT = 3.5           # footstep threshold multiplier
+TH_K_GUN = 4.0            # gunfire threshold multiplier
+
+# Gunfire rejection parameters
+CREST_GUNFIRE_MIN = 6.0   # minimum crest factor to consider as gunfire
+SPECTRAL_FLAT_GUN = 0.6   # gunfire is more spectrally flat (broadband)
+SPECTRAL_FLAT_FOOT = 0.4  # footsteps are more tonal/narrow
+ATTACK_TIME_GUN = 0.003   # gunfire attack < 3ms
+ATTACK_TIME_FOOT = 0.015  # footsteps have slower attack > 15ms
+
+# Cadence (seconds between steps) - tighter window
+CAD_MIN = 0.18            # minimum time between footsteps
+CAD_MAX = 0.55            # maximum time between footsteps (slow walk)
+CAD_TOLERANCE = 0.15      # how much cadence can vary
+
+# Energy ratio thresholds
+FOOT_TO_GUN_RATIO_MIN = 0.3  # footstep bands must have this ratio vs gun bands
+GUN_TO_FOOT_RATIO_MIN = 2.0  # gunfire must be this much stronger in gun bands
 
 # UI
 UI_FPS = 60
-SHOT_DECAY = 0.25
-FOOT_DECAY = 0.45
+SHOT_DECAY = 0.20         # faster decay for gunshots
+FOOT_DECAY = 0.50         # slower decay for footsteps (linger longer)
+
+# Overlay styles
+OVERLAY_EDGE = "edge"
+OVERLAY_HUD = "hud"
+OVERLAY_RING = "ring"
 
 # =========================
 #     DSP HELPERS
 # =========================
 
 def band_sos(low, high, fs=FS, order=4):
-    return butter(order, [low/(fs/2), high/(fs/2)], btype='bandpass', output='sos')
+    nyq = fs / 2
+    low_norm = max(low / nyq, 0.001)
+    high_norm = min(high / nyq, 0.999)
+    return butter(order, [low_norm, high_norm], btype='bandpass', output='sos')
 
-SOS_FA = band_sos(*FOOT_A)
-SOS_FB = band_sos(*FOOT_B)
-SOS_G1 = band_sos(*GUN_1)
-SOS_G2 = band_sos(*GUN_2)
+# Footstep filters (3 bands for better isolation)
+SOS_FOOT_LOW = band_sos(*FOOT_LOW)
+SOS_FOOT_MID = band_sos(*FOOT_MID)
+SOS_FOOT_HIGH = band_sos(*FOOT_HIGH)
 
-def ste(x): 
+# Gunfire filters (3 bands)
+SOS_GUN_LOW = band_sos(*GUN_LOW)
+SOS_GUN_MID = band_sos(*GUN_MID)
+SOS_GUN_HIGH = band_sos(*GUN_HIGH)
+
+def ste(x):
+    """Short-time energy"""
     return float(np.mean(x**2))
 
-def crest(x):
-    rms = np.sqrt(ste(x)) + EPS
-    return float(np.max(np.abs(x)) / rms)
+def rms(x):
+    """Root mean square"""
+    return float(np.sqrt(np.mean(x**2)))
 
-def gcc_phat(x, y, fs=FS, interp=4):
-    n = int(2 ** np.ceil(np.log2(len(x) + len(y))))
-    X = np.fft.rfft(x, n)
-    Y = np.fft.rfft(y, n)
+def crest(x):
+    """Crest factor: peak/RMS ratio - high for impulsive sounds like gunfire"""
+    r = rms(x) + EPS
+    return float(np.max(np.abs(x)) / r)
+
+def spectral_flatness(x, fs=FS):
+    """
+    Spectral flatness (Wiener entropy): geometric mean / arithmetic mean of spectrum.
+    Returns 0-1 where 1 = white noise (flat), 0 = pure tone.
+    Gunfire tends to be more flat (broadband), footsteps more tonal.
+    """
+    spectrum = np.abs(np.fft.rfft(x))
+    spectrum = spectrum[1:]  # skip DC
+    spectrum = np.maximum(spectrum, EPS)
+    geo_mean = np.exp(np.mean(np.log(spectrum)))
+    arith_mean = np.mean(spectrum)
+    return float(geo_mean / (arith_mean + EPS))
+
+def attack_time(x, fs=FS, threshold=0.9):
+    """
+    Estimate attack time: how quickly signal reaches peak.
+    Gunfire: very fast attack (< 3ms)
+    Footsteps: slower attack (> 10ms)
+    Returns time in seconds.
+    """
+    envelope = np.abs(x)
+    # Smooth envelope
+    window_size = max(1, int(fs * 0.001))  # 1ms smoothing
+    if len(envelope) > window_size:
+        envelope = np.convolve(envelope, np.ones(window_size)/window_size, mode='same')
+
+    peak_idx = np.argmax(envelope)
+    peak_val = envelope[peak_idx]
+    if peak_val < EPS:
+        return 1.0  # no signal
+
+    # Find when signal first exceeds threshold of peak (looking backward from peak)
+    thresh_val = threshold * peak_val
+    attack_start = 0
+    for i in range(peak_idx, -1, -1):
+        if envelope[i] < thresh_val * 0.1:  # 10% of threshold
+            attack_start = i
+            break
+
+    attack_samples = peak_idx - attack_start
+    return float(attack_samples / fs)
+
+def zero_crossing_rate(x):
+    """Zero crossing rate - higher for noisy/broadband signals"""
+    signs = np.sign(x)
+    signs[signs == 0] = 1
+    crossings = np.sum(np.abs(np.diff(signs)) > 0)
+    return float(crossings / len(x))
+
+def gcc_phat(x, y, fs=FS, interp=8):
+    """
+    Generalized Cross-Correlation with Phase Transform.
+    Improved with better interpolation and peak detection.
+    Returns (time_delay, confidence).
+    """
+    # Zero-pad for better frequency resolution
+    n = int(2 ** np.ceil(np.log2(len(x) * 2)))
+
+    # Apply window to reduce edge effects
+    window = np.hanning(len(x))
+    x_win = x * window
+    y_win = y * window
+
+    X = np.fft.rfft(x_win, n)
+    Y = np.fft.rfft(y_win, n)
+
+    # Cross-power spectrum with PHAT weighting
     R = X * np.conj(Y)
-    R /= np.maximum(np.abs(R), EPS)
-    cc = np.fft.irfft(R, n*interp)
-    max_shift = int(len(x)*interp//2)
-    cc = np.concatenate((cc[-max_shift:], cc[:max_shift+1]))
-    idx = int(np.argmax(cc))
-    peak = cc[idx]
-    tau = (idx - max_shift) / (fs * interp)
-    conf = float((peak - np.mean(cc)) / (np.std(cc) + EPS))
+    magnitude = np.abs(R)
+    R = R / np.maximum(magnitude, EPS)
+
+    # Inverse FFT with interpolation
+    cc = np.fft.irfft(R, n * interp)
+
+    # Calculate maximum possible delay based on ear distance
+    max_delay_samples = int((EAR_DIST / SPEED_SOUND) * fs * interp) + 1
+    max_delay_samples = min(max_delay_samples, len(cc) // 2)
+
+    # Extract relevant portion (center around zero lag)
+    cc_center = np.concatenate([cc[-max_delay_samples:], cc[:max_delay_samples + 1]])
+
+    # Find peak with parabolic interpolation for sub-sample accuracy
+    idx = int(np.argmax(cc_center))
+    peak = cc_center[idx]
+
+    # Parabolic interpolation for better accuracy
+    if 0 < idx < len(cc_center) - 1:
+        alpha = cc_center[idx - 1]
+        beta = cc_center[idx]
+        gamma = cc_center[idx + 1]
+        denom = alpha - 2*beta + gamma
+        if abs(denom) > EPS:
+            p = 0.5 * (alpha - gamma) / denom
+            idx = idx + p
+
+    # Convert to time delay
+    tau = (idx - max_delay_samples) / (fs * interp)
+
+    # Confidence based on peak sharpness
+    mean_cc = np.mean(np.abs(cc_center))
+    std_cc = np.std(cc_center) + EPS
+    conf = float((peak - mean_cc) / std_cc)
+
     return tau, conf
 
 class RollingStats:
@@ -140,91 +264,292 @@ class AudioEvent:
     t: float                  # timestamp (monotonic)
 
 class EventDetector:
-    def __init__(self, sensitivity: float = 1.0):
+    """
+    Improved event detector with better footstep/gunfire discrimination.
+    Uses multiple features: frequency bands, crest factor, spectral flatness,
+    attack time, and cadence analysis.
+    """
+
+    def __init__(self, sensitivity: float = 1.0, debug: bool = False):
+        # Separate stats for footstep and gunfire bands
         self.stats = {
-            'FA': RollingStats(),
-            'FB': RollingStats(),
-            'G' : RollingStats(),
+            'foot_low': RollingStats(),
+            'foot_mid': RollingStats(),
+            'foot_high': RollingStats(),
+            'gun_low': RollingStats(),
+            'gun_mid': RollingStats(),
+            'gun_high': RollingStats(),
         }
         self.recent_foot_times: List[float] = []
-        # Lower K -> more sensitive; scale Ks by 1/sensitivity
-        s = max(sensitivity, 1e-3)
-        self.k_fa = TH_K_FA / s
-        self.k_fb = TH_K_FB / s
-        self.k_g  = TH_K_G  / s
+        self.recent_gun_times: List[float] = []
+        self.last_event_time: float = 0.0
+        self.debug = debug
 
-    def _dir_from_lr(self, srcL, srcR):
-        tau, cc = gcc_phat(srcL, srcR)
-        tau = float(np.clip(tau, -EAR_DIST/SPEED_SOUND, EAR_DIST/SPEED_SOUND))
-        theta_itd = math.asin((SPEED_SOUND * tau) / EAR_DIST)
-        ild = 20*math.log10((math.sqrt(ste(srcR))+EPS)/(math.sqrt(ste(srcL))+EPS))
-        theta_ild = math.radians(np.clip(ild * 3.0, -90, 90))  # crude ILD→angle slope
-        theta = 0.65*theta_itd + 0.35*theta_ild
-        conf_dir = float(np.clip(cc/8.0, 0.0, 1.0))
+        # Scale thresholds by sensitivity (higher = more sensitive = lower threshold)
+        s = max(sensitivity, 0.1)
+        self.k_foot = TH_K_FOOT / s
+        self.k_gun = TH_K_GUN / s
+
+        # Cooldown to prevent rapid re-triggering
+        self.min_event_gap = 0.05  # 50ms minimum between events
+
+    def _compute_direction(self, srcL: np.ndarray, srcR: np.ndarray) -> tuple:
+        """
+        Compute direction using improved ITD (GCC-PHAT) and ILD fusion.
+        Returns (theta_radians, confidence).
+        """
+        # ITD via GCC-PHAT
+        tau, gcc_conf = gcc_phat(srcL, srcR)
+
+        # Clamp tau to physical limits
+        max_tau = EAR_DIST / SPEED_SOUND
+        tau = float(np.clip(tau, -max_tau, max_tau))
+
+        # Convert ITD to angle (arcsin)
+        sin_theta = (SPEED_SOUND * tau) / EAR_DIST
+        sin_theta = float(np.clip(sin_theta, -1.0, 1.0))
+        theta_itd = math.asin(sin_theta)
+
+        # ILD (Interaural Level Difference)
+        rms_l = rms(srcL) + EPS
+        rms_r = rms(srcR) + EPS
+        ild_db = 20.0 * math.log10(rms_r / rms_l)
+
+        # Convert ILD to angle estimate
+        # Typical ILD is ~1-2 dB per 10 degrees for low frequencies, more for high
+        # Use a gentler slope for better accuracy
+        ild_slope = 2.5  # degrees per dB
+        theta_ild = math.radians(np.clip(ild_db * ild_slope, -90, 90))
+
+        # Fusion: weight ITD more for low frequencies, ILD more for high
+        # For mixed signals, use balanced weighting
+        # ITD is generally more reliable for direction
+        theta = 0.7 * theta_itd + 0.3 * theta_ild
+
+        # Direction confidence based on GCC peak quality
+        conf_dir = float(np.clip(gcc_conf / 6.0, 0.0, 1.0))
+
+        # Reduce confidence if left/right levels are very different (might be mono or panned)
+        level_ratio = max(rms_l, rms_r) / (min(rms_l, rms_r) + EPS)
+        if level_ratio > 10.0:  # Very unbalanced, might be hard-panned effect
+            conf_dir *= 0.5
+
         return theta, conf_dir
 
+    def _is_gunfire(self, frame: np.ndarray, e_gun: float, e_foot: float) -> tuple:
+        """
+        Determine if the current frame is gunfire rather than footsteps.
+        Returns (is_gunfire: bool, confidence: float).
+        """
+        mono = np.mean(frame, axis=1) if frame.ndim > 1 else frame
+
+        # Feature 1: Crest factor (gunfire has very high crest)
+        cf = crest(mono)
+        crest_score = float(np.clip((cf - CREST_GUNFIRE_MIN) / 4.0, 0.0, 1.0))
+
+        # Feature 2: Spectral flatness (gunfire is more broadband)
+        sf = spectral_flatness(mono)
+        flatness_score = float(np.clip((sf - SPECTRAL_FLAT_FOOT) / (SPECTRAL_FLAT_GUN - SPECTRAL_FLAT_FOOT), 0.0, 1.0))
+
+        # Feature 3: Attack time (gunfire has very fast attack)
+        at = attack_time(mono)
+        attack_score = float(np.clip(1.0 - (at / ATTACK_TIME_FOOT), 0.0, 1.0))
+
+        # Feature 4: Energy ratio (gunfire bands vs footstep bands)
+        energy_ratio = e_gun / (e_foot + EPS)
+        ratio_score = float(np.clip((energy_ratio - 1.0) / (GUN_TO_FOOT_RATIO_MIN - 1.0), 0.0, 1.0))
+
+        # Combine scores with weights
+        gunfire_score = (
+            0.30 * crest_score +
+            0.25 * flatness_score +
+            0.25 * attack_score +
+            0.20 * ratio_score
+        )
+
+        is_gunfire = gunfire_score > 0.5
+
+        if self.debug:
+            logging.debug(
+                f"Gunfire check: crest={cf:.1f}({crest_score:.2f}) flat={sf:.2f}({flatness_score:.2f}) "
+                f"attack={at*1000:.1f}ms({attack_score:.2f}) ratio={energy_ratio:.1f}({ratio_score:.2f}) "
+                f"=> score={gunfire_score:.2f} is_gun={is_gunfire}"
+            )
+
+        return is_gunfire, gunfire_score
+
+    def _cadence_confidence(self, now: float) -> float:
+        """
+        Calculate confidence boost based on footstep cadence pattern.
+        Regular footstep cadence increases confidence.
+        """
+        if len(self.recent_foot_times) < 2:
+            return 0.0
+
+        # Calculate recent intervals
+        intervals = []
+        times = self.recent_foot_times[-6:]  # Last 6 footsteps
+        for i in range(1, len(times)):
+            intervals.append(times[i] - times[i-1])
+
+        if not intervals:
+            return 0.0
+
+        # Check if intervals are in valid cadence range
+        valid_intervals = [d for d in intervals if CAD_MIN <= d <= CAD_MAX]
+        if not valid_intervals:
+            return 0.0
+
+        # Check for regularity (low variance in intervals)
+        if len(valid_intervals) >= 2:
+            mean_interval = np.mean(valid_intervals)
+            std_interval = np.std(valid_intervals)
+            regularity = 1.0 - min(1.0, std_interval / (mean_interval + EPS))
+        else:
+            regularity = 0.5
+
+        # Confidence based on how many valid intervals and their regularity
+        coverage = len(valid_intervals) / len(intervals)
+        cadence_conf = coverage * regularity * 0.3  # Max 0.3 boost
+
+        return float(cadence_conf)
+
     def detect(self, frame_lr: np.ndarray) -> Optional[AudioEvent]:
-        L, R = frame_lr[:,0], frame_lr[:,1]
-
-        # Bandpass
-        FA_L, FA_R = sosfilt(SOS_FA, L), sosfilt(SOS_FA, R)
-        FB_L, FB_R = sosfilt(SOS_FB, L), sosfilt(SOS_FB, R)
-        G1_L, G1_R = sosfilt(SOS_G1, L), sosfilt(SOS_G1, R)
-        G2_L, G2_R = sosfilt(SOS_G2, L), sosfilt(SOS_G2, R)
-
-        # Energies
-        e_FA = ste(np.hstack((FA_L, FA_R)))
-        e_FB = ste(np.hstack((FB_L, FB_R)))
-        e_G  = ste(np.hstack((G1_L+G2_L, G1_R+G2_R)))
-        cf   = crest(np.hstack((L, R)))
-
-        # Update adaptive floors
-        self.stats['FA'].update(e_FA)
-        self.stats['FB'].update(e_FB)
-        self.stats['G'].update(e_G)
-
-        # Adaptive thresholds
-        th_FA = self.stats['FA'].mu + self.k_fa * self.stats['FA'].sigma
-        th_FB = self.stats['FB'].mu + self.k_fb * self.stats['FB'].sigma
-        th_G  = self.stats['G' ].mu + self.k_g  * self.stats['G' ].sigma
-
-        # Shot rejector
-        shot_like = (e_G > th_G) and (cf >= CREST_SHOT)
-
+        """
+        Detect audio events in a stereo frame.
+        Returns AudioEvent if detected, None otherwise.
+        """
         now = time.monotonic()
 
-        if shot_like:
-            srcL, srcR = (G1_L+G2_L), (G1_R+G2_R)
-            theta, conf_dir = self._dir_from_lr(srcL, srcR)
-            intensity = float(min(1.0, math.sqrt(e_G) * 60))
-            confidence = float(np.clip((conf_dir*0.6) + 0.4, 0.0, 1.0))
-            return AudioEvent('shot', theta, intensity, confidence, now)
-
-        # Footstep?
-        foot_hit = (e_FA > th_FA) or (e_FB > th_FB)
-        if not foot_hit:
+        # Cooldown check
+        if (now - self.last_event_time) < self.min_event_gap:
             return None
 
-        srcL = 0.4*FA_L + 0.6*FB_L
-        srcR = 0.4*FA_R + 0.6*FB_R
-        theta, conf_dir = self._dir_from_lr(srcL, srcR)
+        L, R = frame_lr[:, 0], frame_lr[:, 1]
+        mono = (L + R) / 2.0
 
-        # Cadence prior
-        self.recent_foot_times.append(now)
-        if len(self.recent_foot_times) > 12:
-            self.recent_foot_times = self.recent_foot_times[-12:]
-        conf_cad = 0.0
-        if len(self.recent_foot_times) >= 3:
-            d1 = self.recent_foot_times[-1] - self.recent_foot_times[-2]
-            d2 = self.recent_foot_times[-2] - self.recent_foot_times[-3]
-            good1 = CAD_MIN <= d1 <= CAD_MAX
-            good2 = CAD_MIN <= d2 <= CAD_MAX
-            conf_cad = 0.25*(1.0 if good1 else 0.0) + 0.25*(1.0 if good2 else 0.0)
+        # Apply bandpass filters - Footstep bands
+        foot_low_L = sosfilt(SOS_FOOT_LOW, L)
+        foot_low_R = sosfilt(SOS_FOOT_LOW, R)
+        foot_mid_L = sosfilt(SOS_FOOT_MID, L)
+        foot_mid_R = sosfilt(SOS_FOOT_MID, R)
+        foot_high_L = sosfilt(SOS_FOOT_HIGH, L)
+        foot_high_R = sosfilt(SOS_FOOT_HIGH, R)
 
-        intensity = float(np.clip(np.sqrt(0.4*e_FA + 0.6*e_FB) * 70, 0.0, 1.0))
-        conf_base = float(np.clip(((e_FA - th_FA)/(th_FA+EPS))*0.4 + ((e_FB - th_FB)/(th_FB+EPS))*0.6, 0, 1))
-        confidence = float(np.clip(0.5*conf_base + 0.25*conf_dir + conf_cad, 0.0, 1.0))
-        return AudioEvent('footstep', theta, intensity, confidence, now)
+        # Apply bandpass filters - Gunfire bands
+        gun_low_L = sosfilt(SOS_GUN_LOW, L)
+        gun_low_R = sosfilt(SOS_GUN_LOW, R)
+        gun_mid_L = sosfilt(SOS_GUN_MID, L)
+        gun_mid_R = sosfilt(SOS_GUN_MID, R)
+        gun_high_L = sosfilt(SOS_GUN_HIGH, L)
+        gun_high_R = sosfilt(SOS_GUN_HIGH, R)
+
+        # Calculate energies
+        e_foot_low = ste(np.hstack([foot_low_L, foot_low_R]))
+        e_foot_mid = ste(np.hstack([foot_mid_L, foot_mid_R]))
+        e_foot_high = ste(np.hstack([foot_high_L, foot_high_R]))
+        e_gun_low = ste(np.hstack([gun_low_L, gun_low_R]))
+        e_gun_mid = ste(np.hstack([gun_mid_L, gun_mid_R]))
+        e_gun_high = ste(np.hstack([gun_high_L, gun_high_R]))
+
+        # Update rolling statistics
+        self.stats['foot_low'].update(e_foot_low)
+        self.stats['foot_mid'].update(e_foot_mid)
+        self.stats['foot_high'].update(e_foot_high)
+        self.stats['gun_low'].update(e_gun_low)
+        self.stats['gun_mid'].update(e_gun_mid)
+        self.stats['gun_high'].update(e_gun_high)
+
+        # Combined energies
+        e_foot_total = 0.3 * e_foot_low + 0.5 * e_foot_mid + 0.2 * e_foot_high
+        e_gun_total = 0.2 * e_gun_low + 0.5 * e_gun_mid + 0.3 * e_gun_high
+
+        # Adaptive thresholds
+        th_foot_low = self.stats['foot_low'].mu + self.k_foot * self.stats['foot_low'].sigma
+        th_foot_mid = self.stats['foot_mid'].mu + self.k_foot * self.stats['foot_mid'].sigma
+        th_foot_high = self.stats['foot_high'].mu + self.k_foot * self.stats['foot_high'].sigma
+
+        th_gun_low = self.stats['gun_low'].mu + self.k_gun * self.stats['gun_low'].sigma
+        th_gun_mid = self.stats['gun_mid'].mu + self.k_gun * self.stats['gun_mid'].sigma
+        th_gun_high = self.stats['gun_high'].mu + self.k_gun * self.stats['gun_high'].sigma
+
+        # Check if we have significant energy in any band
+        foot_triggered = (
+            (e_foot_low > th_foot_low) or
+            (e_foot_mid > th_foot_mid) or
+            (e_foot_high > th_foot_high)
+        )
+
+        gun_triggered = (
+            (e_gun_low > th_gun_low) or
+            (e_gun_mid > th_gun_mid) or
+            (e_gun_high > th_gun_high)
+        )
+
+        if not foot_triggered and not gun_triggered:
+            return None
+
+        # Determine if this is gunfire or footsteps using multiple features
+        is_gunfire, gun_score = self._is_gunfire(frame_lr, e_gun_total, e_foot_total)
+
+        if is_gunfire and gun_triggered:
+            # It's gunfire
+            srcL = gun_low_L + gun_mid_L + gun_high_L
+            srcR = gun_low_R + gun_mid_R + gun_high_R
+            theta, conf_dir = self._compute_direction(srcL, srcR)
+
+            # Intensity based on energy
+            intensity = float(np.clip(math.sqrt(e_gun_total) * 40, 0.0, 1.0))
+
+            # Confidence combines detection certainty and direction confidence
+            confidence = float(np.clip(0.5 * gun_score + 0.5 * conf_dir, 0.0, 1.0))
+
+            # Record timing
+            self.recent_gun_times.append(now)
+            if len(self.recent_gun_times) > 10:
+                self.recent_gun_times = self.recent_gun_times[-10:]
+            self.last_event_time = now
+
+            return AudioEvent('shot', theta, intensity, confidence, now)
+
+        elif foot_triggered and not is_gunfire:
+            # It's a footstep
+            # Use weighted combination of footstep bands for direction
+            srcL = 0.3 * foot_low_L + 0.5 * foot_mid_L + 0.2 * foot_high_L
+            srcR = 0.3 * foot_low_R + 0.5 * foot_mid_R + 0.2 * foot_high_R
+            theta, conf_dir = self._compute_direction(srcL, srcR)
+
+            # Intensity based on energy
+            intensity = float(np.clip(math.sqrt(e_foot_total) * 60, 0.0, 1.0))
+
+            # Base confidence from threshold excess
+            excess_low = max(0, (e_foot_low - th_foot_low) / (th_foot_low + EPS))
+            excess_mid = max(0, (e_foot_mid - th_foot_mid) / (th_foot_mid + EPS))
+            excess_high = max(0, (e_foot_high - th_foot_high) / (th_foot_high + EPS))
+            conf_energy = float(np.clip((0.3*excess_low + 0.5*excess_mid + 0.2*excess_high) / 2.0, 0.0, 0.5))
+
+            # Add cadence confidence
+            self.recent_foot_times.append(now)
+            if len(self.recent_foot_times) > 12:
+                self.recent_foot_times = self.recent_foot_times[-12:]
+            conf_cadence = self._cadence_confidence(now)
+
+            # Penalize if this could also be gunfire (uncertain classification)
+            classification_penalty = 0.0
+            if gun_score > 0.3:
+                classification_penalty = gun_score * 0.3
+
+            # Combined confidence
+            confidence = float(np.clip(
+                conf_energy + 0.3 * conf_dir + conf_cadence - classification_penalty,
+                0.0, 1.0
+            ))
+
+            self.last_event_time = now
+
+            return AudioEvent('footstep', theta, intensity, confidence, now)
+
+        return None
 
 # =========================
 #     STATE / OVERLAY DATA
@@ -267,9 +592,246 @@ class EventState:
 # =========================
 
 if PYSIDE:
-    class CompassOverlay(QtWidgets.QWidget):
+    class EdgeOverlay(QtWidgets.QWidget):
+        """
+        Edge-of-screen directional indicators.
+        Shows arrows/chevrons at screen edges pointing to sound sources.
+        """
         def __init__(self, state: EventState, show_fps=UI_FPS):
-            super().__init__(None, QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
+            super().__init__(None, QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint |
+                           QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+            self.state = state
+            self.timer = QtCore.QTimer(self)
+            self.timer.timeout.connect(self.update)
+            self.timer.start(int(1000/show_fps))
+
+            # Fullscreen, click-through
+            screen = QtWidgets.QApplication.primaryScreen().geometry()
+            self.setGeometry(screen)
+            self.show()
+
+        def _draw_edge_indicator(self, painter: QtGui.QPainter, theta: float, alpha: int,
+                                  is_footstep: bool, intensity: float):
+            """Draw an arrow indicator at the screen edge based on direction."""
+            rect = self.rect()
+            w, h = rect.width(), rect.height()
+            cx, cy = w // 2, h // 2
+
+            # Convert theta to screen position
+            # theta: 0 = front/top, positive = right, negative = left
+            # Map to screen edges
+
+            # Determine which edge and position along that edge
+            # Front (0°) = top center, Back (±180°) = bottom center
+            # Left (-90°) = left center, Right (+90°) = right center
+
+            deg = math.degrees(theta)
+            margin = 40  # Distance from screen edge
+            indicator_size = int(30 + 20 * intensity)  # Size based on intensity
+
+            # Color based on type
+            if is_footstep:
+                color = QtGui.QColor(0, 200, 255, alpha)  # Cyan for footsteps
+            else:
+                color = QtGui.QColor(255, 80, 40, alpha)  # Orange-red for gunshots
+
+            # Calculate position on screen edge
+            # Use angle to determine edge and position
+            if -45 <= deg <= 45:
+                # Top edge (front)
+                x = cx + int((deg / 45.0) * (w // 2 - margin))
+                y = margin
+                rotation = 180  # Arrow pointing down (into screen = forward)
+            elif 45 < deg <= 135:
+                # Right edge
+                normalized = (deg - 45) / 90.0
+                x = w - margin
+                y = int(margin + normalized * (h - 2 * margin))
+                rotation = 270  # Arrow pointing left (into screen)
+            elif -135 <= deg < -45:
+                # Left edge
+                normalized = (deg + 135) / 90.0
+                x = margin
+                y = int(margin + normalized * (h - 2 * margin))
+                rotation = 90  # Arrow pointing right (into screen)
+            else:
+                # Bottom edge (behind)
+                if deg > 0:
+                    normalized = (deg - 135) / 45.0
+                else:
+                    normalized = (deg + 180) / 45.0 - 1.0
+                x = cx + int(normalized * (w // 2 - margin))
+                y = h - margin
+                rotation = 0  # Arrow pointing up (into screen = behind)
+
+            # Draw chevron/arrow
+            painter.save()
+            painter.translate(x, y)
+            painter.rotate(rotation)
+
+            # Create chevron path
+            path = QtGui.QPainterPath()
+            s = indicator_size
+            path.moveTo(0, -s//2)
+            path.lineTo(-s//2, s//2)
+            path.moveTo(0, -s//2)
+            path.lineTo(s//2, s//2)
+
+            # Draw with glow effect for visibility
+            pen_width = 4 if is_footstep else 6
+            # Outer glow
+            glow_color = QtGui.QColor(color)
+            glow_color.setAlpha(alpha // 3)
+            painter.setPen(QtGui.QPen(glow_color, pen_width + 4, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            painter.drawPath(path)
+            # Inner line
+            painter.setPen(QtGui.QPen(color, pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            painter.drawPath(path)
+
+            painter.restore()
+
+        def paintEvent(self, event):
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+            now = time.monotonic()
+            for m in self.state.get_markers():
+                alpha = int(255 * m.alpha(now))
+                if alpha <= 5:
+                    continue
+                self._draw_edge_indicator(painter, m.theta, alpha,
+                                         m.cls == 'footstep', m.intensity)
+            painter.end()
+
+
+    class HUDCompassOverlay(QtWidgets.QWidget):
+        """
+        Small HUD-style compass in a corner of the screen.
+        Shows a mini radar-like display with directional indicators.
+        """
+        def __init__(self, state: EventState, show_fps=UI_FPS, position="bottom-right"):
+            super().__init__(None, QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint |
+                           QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+            self.state = state
+            self.position = position
+            self.timer = QtCore.QTimer(self)
+            self.timer.timeout.connect(self.update)
+            self.timer.start(int(1000/show_fps))
+
+            # HUD size and position
+            self.hud_size = 150
+            self.margin = 30
+
+            screen = QtWidgets.QApplication.primaryScreen().geometry()
+            self._setup_position(screen)
+            self.show()
+
+        def _setup_position(self, screen_geom):
+            """Position the HUD widget in the specified corner."""
+            size = self.hud_size + self.margin * 2
+            if self.position == "bottom-right":
+                x = screen_geom.width() - size
+                y = screen_geom.height() - size
+            elif self.position == "bottom-left":
+                x = 0
+                y = screen_geom.height() - size
+            elif self.position == "top-right":
+                x = screen_geom.width() - size
+                y = 0
+            elif self.position == "top-left":
+                x = 0
+                y = 0
+            else:  # center-bottom
+                x = (screen_geom.width() - size) // 2
+                y = screen_geom.height() - size
+
+            self.setGeometry(x, y, size, size)
+
+        def paintEvent(self, event):
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+            rect = self.rect()
+            cx, cy = rect.center().x(), rect.center().y()
+            radius = self.hud_size // 2 - 10
+
+            # Draw background circle (semi-transparent)
+            painter.setBrush(QtGui.QColor(0, 0, 0, 100))
+            painter.setPen(QtGui.QPen(QtGui.QColor(100, 100, 100, 150), 2))
+            painter.drawEllipse(QtCore.QPointF(cx, cy), radius + 5, radius + 5)
+
+            # Draw compass ring
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 80), 1))
+            painter.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
+            painter.drawEllipse(QtCore.QPointF(cx, cy), radius * 0.5, radius * 0.5)
+
+            # Draw cardinal direction markers
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 120), 2))
+            # Front marker (top)
+            painter.drawLine(cx, cy - radius + 5, cx, cy - radius + 15)
+            # Small ticks for sides
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 60), 1))
+            painter.drawLine(cx + radius - 5, cy, cx + radius - 12, cy)  # Right
+            painter.drawLine(cx - radius + 5, cy, cx - radius + 12, cy)  # Left
+            painter.drawLine(cx, cy + radius - 5, cx, cy + radius - 12)  # Back
+
+            # Draw player indicator (small triangle at center pointing up)
+            painter.setBrush(QtGui.QColor(255, 255, 255, 150))
+            painter.setPen(QtCore.Qt.NoPen)
+            player_path = QtGui.QPainterPath()
+            player_path.moveTo(cx, cy - 8)
+            player_path.lineTo(cx - 5, cy + 4)
+            player_path.lineTo(cx + 5, cy + 4)
+            player_path.closeSubpath()
+            painter.drawPath(player_path)
+
+            # Draw event markers
+            now = time.monotonic()
+            for m in self.state.get_markers():
+                alpha = int(255 * m.alpha(now))
+                if alpha <= 5:
+                    continue
+
+                # Position on compass (theta: 0=front/up, positive=right)
+                # Scale by intensity for distance effect
+                dist = radius * (0.4 + 0.5 * m.intensity)
+                ax = cx + dist * math.sin(m.theta)
+                ay = cy - dist * math.cos(m.theta)
+
+                # Color and size based on type
+                if m.cls == 'footstep':
+                    color = QtGui.QColor(0, 200, 255, alpha)
+                    dot_size = 6
+                else:
+                    color = QtGui.QColor(255, 80, 40, alpha)
+                    dot_size = 8
+
+                # Draw dot with glow
+                glow_color = QtGui.QColor(color)
+                glow_color.setAlpha(alpha // 2)
+                painter.setBrush(glow_color)
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.drawEllipse(QtCore.QPointF(ax, ay), dot_size + 3, dot_size + 3)
+
+                painter.setBrush(color)
+                painter.drawEllipse(QtCore.QPointF(ax, ay), dot_size, dot_size)
+
+            painter.end()
+
+
+    class RingOverlay(QtWidgets.QWidget):
+        """
+        Original full-screen radial ring compass overlay.
+        Shows a large ring around screen center with directional ticks.
+        """
+        def __init__(self, state: EventState, show_fps=UI_FPS):
+            super().__init__(None, QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint |
+                           QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
             self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
             self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
             self.state = state
@@ -319,6 +881,9 @@ if PYSIDE:
                 painter.drawArc(int(cx-radius), int(cy-radius), int(2*radius), int(2*radius),
                                 int((90 - math.degrees(m.theta) - 6) * 16), int(12 * 16))
             painter.end()
+
+    # Backward compatibility alias
+    CompassOverlay = RingOverlay
 
 # =========================
 #   WINDOWS CORE AUDIO CAPTURE
@@ -841,18 +1406,64 @@ class AudioLoop:
 # =========================
 
 def build_parser():
-    p = argparse.ArgumentParser(description="Audio→Visual Compass (COD/Warzone) — No Haptics")
-    p.add_argument("--device", type=int, default=None, help="WASAPI output device index to loopback-capture (see --list-devices)")
-    p.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
-    p.add_argument("--list-outputs", action="store_true", help="List only output devices and exit")
-    p.add_argument("--choose-device", action="store_true", help="Interactively list devices and prompt for selection, then start")
-    p.add_argument("--no-overlay", action="store_true", help="Disable on-screen compass")
-    p.add_argument("--loglevel", default="INFO", help="Logging level (DEBUG, INFO, WARNING)")
-    p.add_argument("--min-confidence", type=float, default=0.5, help="Minimum event confidence to display (0..1)")
-    p.add_argument("--sensitivity", type=float, default=1.0, help="Detection sensitivity (higher = more sensitive)")
-    p.add_argument("--debug-audio", action="store_true", help="Log periodic audio RMS levels to confirm capture")
-    p.add_argument("--allow-input-fallback", action="store_true", help="Allow automatic fallback to input devices like 'Stereo Mix' if loopback fails (default: disabled)")
-    p.add_argument("--use-loopback-alias", action="store_true", help="Prefer matching '(loopback)' input alias when opening output devices")
+    p = argparse.ArgumentParser(
+        description="Audio→Visual Compass (COD/Warzone) — Directional Audio Detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Overlay Styles:
+  edge    - Arrows at screen edges pointing to sound direction (recommended)
+  hud     - Small radar compass in corner of screen
+  ring    - Large ring around screen center (original style)
+
+Examples:
+  python "BotLobbies StepSense.py" --list-outputs
+  python "BotLobbies StepSense.py" --device 13 --overlay edge
+  python "BotLobbies StepSense.py" --device 13 --overlay hud --hud-position bottom-right
+  python "BotLobbies StepSense.py" --device 13 --debug-audio --sensitivity 1.5
+"""
+    )
+    p.add_argument("--device", type=int, default=None,
+                   help="WASAPI output device index to loopback-capture (see --list-devices)")
+    p.add_argument("--list-devices", action="store_true",
+                   help="List audio devices and exit")
+    p.add_argument("--list-outputs", action="store_true",
+                   help="List only output devices and exit")
+    p.add_argument("--choose-device", action="store_true",
+                   help="Interactively list devices and prompt for selection, then start")
+
+    # Overlay options
+    p.add_argument("--overlay", type=str, default="edge", choices=["edge", "hud", "ring", "none"],
+                   help="Overlay style: 'edge' (screen edge arrows), 'hud' (corner compass), 'ring' (center ring), 'none' (disabled)")
+    p.add_argument("--no-overlay", action="store_true",
+                   help="Disable on-screen compass (same as --overlay none)")
+    p.add_argument("--hud-position", type=str, default="bottom-right",
+                   choices=["bottom-right", "bottom-left", "top-right", "top-left", "center-bottom"],
+                   help="Position for HUD compass overlay (default: bottom-right)")
+
+    # Detection tuning
+    p.add_argument("--sensitivity", type=float, default=1.0,
+                   help="Detection sensitivity multiplier (higher = more sensitive, default=1.0)")
+    p.add_argument("--min-confidence", type=float, default=0.4,
+                   help="Minimum event confidence to display, 0.0-1.0 (default=0.4)")
+    p.add_argument("--footsteps-only", action="store_true",
+                   help="Only show footstep detections, ignore gunfire")
+    p.add_argument("--gunfire-only", action="store_true",
+                   help="Only show gunfire detections, ignore footsteps")
+
+    # Debug and logging
+    p.add_argument("--loglevel", default="INFO",
+                   help="Logging level (DEBUG, INFO, WARNING)")
+    p.add_argument("--debug-audio", action="store_true",
+                   help="Log periodic audio RMS levels to confirm capture")
+    p.add_argument("--debug-detection", action="store_true",
+                   help="Log detailed detection analysis (gunfire vs footstep scoring)")
+
+    # Audio device options
+    p.add_argument("--allow-input-fallback", action="store_true",
+                   help="Allow automatic fallback to input devices like 'Stereo Mix' if loopback fails")
+    p.add_argument("--use-loopback-alias", action="store_true",
+                   help="Prefer matching '(loopback)' input alias when opening output devices")
+
     return p
 
 def list_devices():
@@ -922,122 +1533,152 @@ def choose_device_interactive() -> Optional[int]:
         return None
     return idx
 
+def create_overlay(state: EventState, overlay_style: str, hud_position: str):
+    """Create the appropriate overlay widget based on style selection."""
+    if not PYSIDE:
+        return None
+
+    if overlay_style == "edge":
+        return EdgeOverlay(state)
+    elif overlay_style == "hud":
+        return HUDCompassOverlay(state, position=hud_position)
+    elif overlay_style == "ring":
+        return RingOverlay(state)
+    else:
+        return None
+
+
 def main():
     args = build_parser().parse_args()
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s: %(message)s")
 
-    if args.choose_device:
-        # Interactive selection with retry if stream open fails
-        while True:
-            idx = choose_device_interactive()
-            if idx is None:
-                return
-            args.device = idx
-            detector = EventDetector(sensitivity=args.sensitivity)
-            state = EventState()
-            audio = AudioLoop(device_index=args.device, allow_input_fallback=args.allow_input_fallback, force_loopback_alias=args.use_loopback_alias)
-
-            def on_frame(frame_lr):
-                evt = detector.detect(frame_lr)
-                if args.debug_audio:
-                    # Lightweight RMS meter every ~0.5s
-                    if not hasattr(on_frame, "_acc"):
-                        on_frame._acc = 0
-                        on_frame._t0 = time.monotonic()
-                    on_frame._acc += float(np.sqrt(np.mean(frame_lr**2)))
-                    if (time.monotonic() - on_frame._t0) >= 0.5:
-                        rms = on_frame._acc / max(1, int(0.5/(HOP/FS)))
-                        logging.info("AUDIO RMS ~ %.4f", rms)
-                        on_frame._acc = 0
-                        on_frame._t0 = time.monotonic()
-                if evt and evt.confidence >= args.min_confidence:
-                    state.push(evt)
-                    logging.debug(f"{evt.cls:8s} az={math.degrees(evt.theta):+05.1f}° I={evt.intensity:.2f} C={evt.confidence:.2f}")
-            try:
-                audio.start(on_frame)
-                break  # success
-            except Exception as e:
-                logging.error("Failed to open device %s: %s", idx, e)
-                print("\nCould not open that device. Please choose another output device.\n")
-                continue
-        # proceed with overlay/headless using objects created above
-        # Overlay or headless
-        if args.no_overlay or not PYSIDE:
-            if not PYSIDE and not args.no_overlay:
-                logging.warning("PySide6 not available; running headless (no overlay).")
-            print("Running… Press Ctrl+C to quit.")
-            try:
-                while True:
-                    time.sleep(1.0)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                audio.stop()
-                return
-
-        app = QtWidgets.QApplication([])
-        overlay = CompassOverlay(state)
-        try:
-            app.exec()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            audio.stop()
-        return
-    elif args.list_outputs:
+    # Handle list commands first
+    if args.list_outputs:
         list_output_devices()
         return
     elif args.list_devices:
         list_devices()
         return
 
-    detector = EventDetector(sensitivity=args.sensitivity)
-    state = EventState()
-    audio = AudioLoop(device_index=args.device, allow_input_fallback=args.allow_input_fallback, force_loopback_alias=args.use_loopback_alias)
+    # Determine overlay style
+    overlay_style = args.overlay
+    if args.no_overlay:
+        overlay_style = "none"
 
-    def on_frame(frame_lr):
-        evt = detector.detect(frame_lr)
-        if args.debug_audio:
-            if not hasattr(on_frame, "_acc"):
-                on_frame._acc = 0
-                on_frame._t0 = time.monotonic()
-            on_frame._acc += float(np.sqrt(np.mean(frame_lr**2)))
-            if (time.monotonic() - on_frame._t0) >= 0.5:
-                rms = on_frame._acc / max(1, int(0.5/(HOP/FS)))
-                logging.info("AUDIO RMS ~ %.4f", rms)
-                on_frame._acc = 0
-                on_frame._t0 = time.monotonic()
-        if evt and evt.confidence >= args.min_confidence:
-            state.push(evt)
-            logging.debug(f"{evt.cls:8s} az={math.degrees(evt.theta):+05.1f}° I={evt.intensity:.2f} C={evt.confidence:.2f}")
+    # Create filter function for event types
+    def event_filter(evt: AudioEvent) -> bool:
+        if evt is None:
+            return False
+        if evt.confidence < args.min_confidence:
+            return False
+        if args.footsteps_only and evt.cls != 'footstep':
+            return False
+        if args.gunfire_only and evt.cls != 'shot':
+            return False
+        return True
 
-    # Start audio
-    audio.start(on_frame)
+    def run_with_device(device_index: Optional[int]) -> bool:
+        """Run the detector with the specified device. Returns True on success."""
+        # Create detector with debug flag
+        detector = EventDetector(
+            sensitivity=args.sensitivity,
+            debug=args.debug_detection
+        )
+        state = EventState()
+        audio = AudioLoop(
+            device_index=device_index,
+            allow_input_fallback=args.allow_input_fallback,
+            force_loopback_alias=args.use_loopback_alias
+        )
 
-    # Overlay or headless
-    if args.no_overlay or not PYSIDE:
-        if not PYSIDE and not args.no_overlay:
-            logging.warning("PySide6 not available; running headless (no overlay).")
-        print("Running… Press Ctrl+C to quit.")
+        def on_frame(frame_lr):
+            evt = detector.detect(frame_lr)
+
+            # Debug audio levels
+            if args.debug_audio:
+                if not hasattr(on_frame, "_acc"):
+                    on_frame._acc = 0
+                    on_frame._t0 = time.monotonic()
+                on_frame._acc += float(np.sqrt(np.mean(frame_lr**2)))
+                if (time.monotonic() - on_frame._t0) >= 0.5:
+                    rms_val = on_frame._acc / max(1, int(0.5/(HOP/FS)))
+                    logging.info("AUDIO RMS ~ %.4f", rms_val)
+                    on_frame._acc = 0
+                    on_frame._t0 = time.monotonic()
+
+            # Filter and push events
+            if event_filter(evt):
+                state.push(evt)
+                logging.info(
+                    f"{evt.cls:8s} az={math.degrees(evt.theta):+06.1f}° "
+                    f"I={evt.intensity:.2f} C={evt.confidence:.2f}"
+                )
+
         try:
-            while True:
-                time.sleep(1.0)
+            audio.start(on_frame)
+        except Exception as e:
+            logging.error("Failed to open audio device: %s", e)
+            return False
+
+        logging.info("Audio capture started successfully")
+        logging.info("Overlay style: %s", overlay_style)
+
+        # Run in headless or overlay mode
+        if overlay_style == "none" or not PYSIDE:
+            if not PYSIDE and overlay_style != "none":
+                logging.warning("PySide6 not available; running headless (no overlay).")
+            print("Running… Press Ctrl+C to quit.")
+            print(f"Detection sensitivity: {args.sensitivity}")
+            print(f"Minimum confidence: {args.min_confidence}")
+            if args.footsteps_only:
+                print("Mode: Footsteps only")
+            elif args.gunfire_only:
+                print("Mode: Gunfire only")
+            try:
+                while True:
+                    time.sleep(1.0)
+            except KeyboardInterrupt:
+                print("\nStopping...")
+            finally:
+                audio.stop()
+            return True
+
+        # Qt overlay mode
+        app = QtWidgets.QApplication([])
+        overlay = create_overlay(state, overlay_style, args.hud_position)
+        if overlay is None:
+            logging.error("Failed to create overlay")
+            audio.stop()
+            return False
+
+        logging.info("Overlay created: %s", type(overlay).__name__)
+
+        try:
+            app.exec()
         except KeyboardInterrupt:
-            pass
+            print("\nStopping...")
         finally:
             audio.stop()
-            return
 
-    # Qt overlay loop
-    app = QtWidgets.QApplication([])
-    overlay = CompassOverlay(state)
-    try:
-        app.exec()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        audio.stop()
+        return True
+
+    # Interactive device selection mode
+    if args.choose_device:
+        while True:
+            idx = choose_device_interactive()
+            if idx is None:
+                return
+            if run_with_device(idx):
+                return
+            print("\nCould not open that device. Please choose another output device.\n")
+            continue
+    else:
+        # Direct device mode
+        if not run_with_device(args.device):
+            print("\nFailed to start. Try --list-outputs to see available devices.")
+            print("Then use --device <index> to select a WASAPI output device.")
+            return
 
 if __name__ == "__main__":
     main()
