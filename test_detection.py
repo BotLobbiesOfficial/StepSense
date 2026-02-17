@@ -53,49 +53,50 @@ def make_noise(duration_samples: int = WIN, amplitude: float = 0.001,
 
 
 def make_footstep_frame(amplitude: float = 0.15, pan: float = 0.0) -> np.ndarray:
-    """Simulate a footstep: energy concentrated in FOOT_A (60-250 Hz).
+    """Simulate a COD footstep hitting both FOOT_A (80-250 Hz) and FOOT_B (2500-6000 Hz).
 
-    Short broadband transient filtered to low frequencies, mimicking a
-    heel impact.
+    Low thump (heel impact) plus high-frequency texture (scrape/surface detail).
+    The competitive COD footstep sweet spot is ~4 kHz.
     """
-    # Low-frequency thump around 120 Hz with quick exponential decay
     t = np.arange(WIN) / FS
     decay = np.exp(-t * 80)  # fast decay
+    # FOOT_A: low thump at 120 Hz
     thump = amplitude * np.sin(2 * np.pi * 120 * t) * decay
-    # Add a bit of scrape in the 800-2000 Hz range
-    scrape = (amplitude * 0.3) * np.sin(2 * np.pi * 1200 * t) * np.exp(-t * 120)
-    mono = (thump + scrape).astype(np.float32)
+    # FOOT_B: texture detail at 3500-4000 Hz (COD competitive sweet spot)
+    scrape = (amplitude * 0.3) * np.sin(2 * np.pi * 4000 * t) * np.exp(-t * 120)
+    texture = (amplitude * 0.15) * np.sin(2 * np.pi * 3200 * t) * np.exp(-t * 100)
+    mono = (thump + scrape + texture).astype(np.float32)
     return make_stereo(mono, pan)
 
 
 def make_gunshot_frame(amplitude: float = 0.6, pan: float = 0.0) -> np.ndarray:
-    """Simulate a gunshot: broadband transient with high crest factor.
+    """Simulate a COD gunshot: broadband transient in GUN_LO (300-1200) + GUN_HI (1200-2500).
 
-    Sharp impulse with energy spread across all bands, especially gun bands.
+    Sharp impulse with high crest factor, energy concentrated below 2500 Hz.
     """
     t = np.arange(WIN) / FS
     # Very sharp attack, fast decay — creates high crest factor
     envelope = np.exp(-t * 200)
-    # Broadband: mix of frequencies across gun bands
+    # Frequencies targeting GUN_LO (300-1200) and GUN_HI (1200-2500)
     signal = (
-        0.3 * np.sin(2 * np.pi * 400 * t) +   # GUN_LO
-        0.3 * np.sin(2 * np.pi * 800 * t) +   # GUN_LO upper
-        0.4 * np.sin(2 * np.pi * 2000 * t) +  # GUN_HI
-        0.3 * np.sin(2 * np.pi * 3500 * t) +  # GUN_HI upper
-        0.2 * np.sin(2 * np.pi * 5000 * t)    # GUN_HI top
+        0.3 * np.sin(2 * np.pi * 500 * t) +   # GUN_LO
+        0.3 * np.sin(2 * np.pi * 900 * t) +   # GUN_LO (small-arms core)
+        0.4 * np.sin(2 * np.pi * 1500 * t) +  # GUN_HI
+        0.3 * np.sin(2 * np.pi * 2000 * t) +  # GUN_HI (crack)
+        0.2 * np.sin(2 * np.pi * 2300 * t)    # GUN_HI upper
     )
     mono = (amplitude * signal * envelope).astype(np.float32)
     return make_stereo(mono, pan)
 
 
 def make_gunshot_tail_frame(amplitude: float = 0.08, pan: float = 0.0) -> np.ndarray:
-    """Simulate the reverb/tail after a gunshot — lower energy, still broadband."""
+    """Simulate the reverb/tail after a gunshot — lower energy, still in gun bands."""
     t = np.arange(WIN) / FS
     envelope = np.exp(-t * 40)
     signal = (
-        0.3 * np.sin(2 * np.pi * 500 * t) +
-        0.4 * np.sin(2 * np.pi * 2000 * t) +
-        0.2 * np.sin(2 * np.pi * 4000 * t)
+        0.3 * np.sin(2 * np.pi * 600 * t) +   # GUN_LO reverb
+        0.4 * np.sin(2 * np.pi * 1400 * t) +  # GUN_HI reverb
+        0.2 * np.sin(2 * np.pi * 2200 * t)    # GUN_HI upper reverb
     )
     mono = (amplitude * signal * envelope).astype(np.float32)
     return make_stereo(mono, pan)
@@ -261,13 +262,13 @@ class TestSpectralRatioRejection:
         det = ss.EventDetector(sensitivity=1.0)
         warm_up_detector(det)
 
-        # Energy concentrated in gun-only bands (outside FOOT_B 800-3000 Hz)
+        # Energy concentrated in gun bands (300-2500 Hz), none in footstep bands
         t = np.arange(WIN) / FS
         signal = (
-            0.10 * np.sin(2 * np.pi * 400 * t) +    # GUN_LO only (200-900)
-            0.10 * np.sin(2 * np.pi * 700 * t) +    # GUN_LO only
-            0.12 * np.sin(2 * np.pi * 4000 * t) +   # GUN_HI only (above FOOT_B)
-            0.10 * np.sin(2 * np.pi * 5500 * t) +   # GUN_HI only
+            0.10 * np.sin(2 * np.pi * 500 * t) +    # GUN_LO (300-1200)
+            0.10 * np.sin(2 * np.pi * 900 * t) +    # GUN_LO
+            0.12 * np.sin(2 * np.pi * 1500 * t) +   # GUN_HI (1200-2500)
+            0.10 * np.sin(2 * np.pi * 2200 * t) +   # GUN_HI
             0.01 * np.sin(2 * np.pi * 150 * t)      # tiny footstep band
         ).astype(np.float32)
         frame = make_stereo(signal, pan=0.0)
@@ -296,8 +297,8 @@ class TestBorderlineShotRejection:
         t = np.arange(WIN) / FS
         envelope = np.exp(-t * 60)  # moderate decay (not as sharp as gunshot)
         signal = (
-            0.15 * np.sin(2 * np.pi * 600 * t) +   # GUN_LO
-            0.15 * np.sin(2 * np.pi * 2500 * t)    # GUN_HI
+            0.15 * np.sin(2 * np.pi * 600 * t) +   # GUN_LO (300-1200)
+            0.15 * np.sin(2 * np.pi * 1800 * t)    # GUN_HI (1200-2500)
         )
         mono = (signal * envelope).astype(np.float32)
         frame = make_stereo(mono, pan=0.0)

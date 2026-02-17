@@ -70,7 +70,7 @@ python "BotLobbies StepSense.py" --list-outputs
 - `--loglevel DEBUG` - Verbose logging
 
 ## Audio Compass Theory
-Uses cross-correlation (GCC-PHAT) and Interaural Level Difference (ILD) to determine the azimuth angle of audio sources. Filters audio into separate bands — footstep low (60-250 Hz), footstep high (800-3000 Hz), gun low (200-900 Hz), gun high (1500-6000 Hz) — with spectral ratio discrimination, crest factor analysis, and post-shot blanking to separate footsteps from gunfire. Adaptive noise floor tracking (updated only during quiet frames) provides robust threshold adaptation.
+Uses cross-correlation (GCC-PHAT) and Interaural Level Difference (ILD) to determine the azimuth angle of audio sources. Filters audio into zero-overlap bands — footstep low (80-250 Hz), footstep high (2500-6000 Hz), gun low (300-1200 Hz), gun high (1200-2500 Hz) — tuned to COD/Warzone audio profiles. The footstep high band targets the competitive "sweet spot" at 4 kHz where footstep texture exists but gunfire energy has dropped off. Spectral ratio discrimination, crest factor analysis, and post-shot blanking separate footsteps from gunfire. Adaptive noise floor tracking (updated only during quiet frames) provides robust threshold adaptation.
 
 ## Notes
 - Designed specifically for Windows WASAPI

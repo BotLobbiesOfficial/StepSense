@@ -58,13 +58,19 @@ EPS = 1e-12
 EAR_DIST = 0.18           # ~18 cm ear spacing
 SPEED_SOUND = 343.0
 
-# Bands (Warzone-tuned)
-# Footstep bands – kept narrow to avoid gunfire overlap
-FOOT_A = (60, 250)        # impact / heel thump
-FOOT_B = (800, 3000)      # tread / scrape (narrowed from 1-4k to reduce gun overlap)
-# Gunshot bands – broadband energy from muzzle blast
-GUN_LO  = (200, 900)      # renamed, tightened to avoid footstep-A overlap
-GUN_HI  = (1500, 6000)    # upper muzzle / crack energy
+# Bands (COD/Warzone-tuned based on competitive audio analysis)
+#
+# Key insight: the 3.5-6 kHz region has footstep texture detail but virtually
+# no gunfire energy — this is the best discrimination zone.  The overlapping
+# 800-2500 Hz region (where both footsteps and gunfire live) is intentionally
+# excluded from the footstep bands to eliminate cross-contamination.
+#
+# Footstep bands — ZERO overlap with gun bands
+FOOT_A = (80, 250)        # impact / heel thump (80 Hz floor cuts sub-bass rumble)
+FOOT_B = (2500, 6000)     # clarity / texture detail (COD competitive sweet spot ~4 kHz)
+# Gunshot bands — ZERO overlap with footstep bands
+GUN_LO  = (300, 1200)     # muzzle blast body + small-arms core (peaks 900-1500 Hz)
+GUN_HI  = (1200, 2500)    # gunshot crack (narrowed — above 2.5 kHz is footstep territory)
 
 # Confidence / thresholds (sigma multipliers for adaptive noise floor)
 TH_K_FA  = 3.0            # footstep low band
@@ -81,7 +87,8 @@ CAD_MAX = 0.55             # widened slightly for slower walk speeds
 SHOT_BLANKING_S = 0.15
 
 # Spectral ratio: if gun-band energy / foot-band energy exceeds this, reject as non-footstep
-GUN_FOOT_RATIO_REJECT = 3.0
+# With zero-overlap bands this can be tighter than before
+GUN_FOOT_RATIO_REJECT = 2.0
 
 # UI
 UI_FPS = 60
