@@ -65,12 +65,12 @@ python "BotLobbies StepSense.py" --list-outputs
 ## Command Line Options
 - `--device N` - Audio device index (use --list-outputs to find)
 - `--debug-audio` - Show RMS levels and detection details
-- `--sensitivity X.X` - Detection sensitivity (default 3.0)
-- `--min-confidence X.X` - Minimum confidence threshold (default 0.7)
+- `--sensitivity X.X` - Detection sensitivity (default 1.0, higher = more sensitive)
+- `--min-confidence X.X` - Minimum confidence threshold (default 0.5)
 - `--loglevel DEBUG` - Verbose logging
 
 ## Audio Compass Theory
-Uses cross-correlation (GCC-PHAT) and Interaural Level Difference (ILD) to determine the azimuth angle of audio sources. Filters audio to footstep frequency ranges (100-4000 Hz) and applies confidence scoring based on signal strength and correlation quality.
+Uses cross-correlation (GCC-PHAT) and Interaural Level Difference (ILD) to determine the azimuth angle of audio sources. Filters audio into separate bands — footstep low (60-250 Hz), footstep high (800-3000 Hz), gun low (200-900 Hz), gun high (1500-6000 Hz) — with spectral ratio discrimination, crest factor analysis, and post-shot blanking to separate footsteps from gunfire. Adaptive noise floor tracking (updated only during quiet frames) provides robust threshold adaptation.
 
 ## Notes
 - Designed specifically for Windows WASAPI

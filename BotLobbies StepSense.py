@@ -59,20 +59,29 @@ EAR_DIST = 0.18           # ~18 cm ear spacing
 SPEED_SOUND = 343.0
 
 # Bands (Warzone-tuned)
-FOOT_A = (60, 250)        # impact / heel
-FOOT_B = (1000, 4000)     # tread / scrape (often mixed hotter)
-GUN_1  = (300, 1200)
-GUN_2  = (1200, 5000)
+# Footstep bands – kept narrow to avoid gunfire overlap
+FOOT_A = (60, 250)        # impact / heel thump
+FOOT_B = (800, 3000)      # tread / scrape (narrowed from 1-4k to reduce gun overlap)
+# Gunshot bands – broadband energy from muzzle blast
+GUN_LO  = (200, 900)      # renamed, tightened to avoid footstep-A overlap
+GUN_HI  = (1500, 6000)    # upper muzzle / crack energy
 
-# Confidence / thresholds
-TH_K_FA = 3.0
-TH_K_FB = 2.5
-TH_K_G  = 3.5
-CREST_SHOT = 8.0
+# Confidence / thresholds (sigma multipliers for adaptive noise floor)
+TH_K_FA  = 3.0            # footstep low band
+TH_K_FB  = 2.5            # footstep high band
+TH_K_GLO = 3.5            # gun low band
+TH_K_GHI = 3.0            # gun high band
+CREST_SHOT = 5.0           # crest factor for shot detection (lowered: game audio is compressed)
 
 # Cadence (seconds between steps)
 CAD_MIN = 0.12
-CAD_MAX = 0.45
+CAD_MAX = 0.55             # widened slightly for slower walk speeds
+
+# Shot suppression – blank footstep detection after a shot for this many seconds
+SHOT_BLANKING_S = 0.15
+
+# Spectral ratio: if gun-band energy / foot-band energy exceeds this, reject as non-footstep
+GUN_FOOT_RATIO_REJECT = 3.0
 
 # UI
 UI_FPS = 60
@@ -86,10 +95,10 @@ FOOT_DECAY = 0.45
 def band_sos(low, high, fs=FS, order=4):
     return butter(order, [low/(fs/2), high/(fs/2)], btype='bandpass', output='sos')
 
-SOS_FA = band_sos(*FOOT_A)
-SOS_FB = band_sos(*FOOT_B)
-SOS_G1 = band_sos(*GUN_1)
-SOS_G2 = band_sos(*GUN_2)
+SOS_FA  = band_sos(*FOOT_A)
+SOS_FB  = band_sos(*FOOT_B)
+SOS_GLO = band_sos(*GUN_LO)
+SOS_GHI = band_sos(*GUN_HI)
 
 def ste(x): 
     return float(np.mean(x**2))
@@ -141,17 +150,35 @@ class AudioEvent:
 
 class EventDetector:
     def __init__(self, sensitivity: float = 1.0):
+        # Separate rolling stats for each band (gun bands tracked independently)
         self.stats = {
-            'FA': RollingStats(),
-            'FB': RollingStats(),
-            'G' : RollingStats(),
+            'FA' : RollingStats(),
+            'FB' : RollingStats(),
+            'GLO': RollingStats(),
+            'GHI': RollingStats(),
         }
         self.recent_foot_times: List[float] = []
+        self.last_shot_time: float = 0.0   # for post-shot blanking
+
         # Lower K -> more sensitive; scale Ks by 1/sensitivity
         s = max(sensitivity, 1e-3)
-        self.k_fa = TH_K_FA / s
-        self.k_fb = TH_K_FB / s
-        self.k_g  = TH_K_G  / s
+        self.k_fa  = TH_K_FA  / s
+        self.k_fb  = TH_K_FB  / s
+        self.k_glo = TH_K_GLO / s
+        self.k_ghi = TH_K_GHI / s
+
+        # Persistent filter states (zi) for continuous filtering across frames
+        n_sos_fa  = SOS_FA.shape[0]
+        n_sos_fb  = SOS_FB.shape[0]
+        n_sos_glo = SOS_GLO.shape[0]
+        n_sos_ghi = SOS_GHI.shape[0]
+        # zi shape: (n_sections, 2) per channel
+        self.zi = {
+            'FA_L':  np.zeros((n_sos_fa,  2)),  'FA_R':  np.zeros((n_sos_fa,  2)),
+            'FB_L':  np.zeros((n_sos_fb,  2)),  'FB_R':  np.zeros((n_sos_fb,  2)),
+            'GLO_L': np.zeros((n_sos_glo, 2)),  'GLO_R': np.zeros((n_sos_glo, 2)),
+            'GHI_L': np.zeros((n_sos_ghi, 2)),  'GHI_R': np.zeros((n_sos_ghi, 2)),
+        }
 
     def _dir_from_lr(self, srcL, srcR):
         tau, cc = gcc_phat(srcL, srcR)
@@ -163,67 +190,144 @@ class EventDetector:
         conf_dir = float(np.clip(cc/8.0, 0.0, 1.0))
         return theta, conf_dir
 
+    def _filt(self, sos, x, key):
+        """Apply sosfilt with persistent state to avoid frame-boundary transients."""
+        y, self.zi[key] = sosfilt(sos, x, zi=self.zi[key])
+        return y
+
     def detect(self, frame_lr: np.ndarray) -> Optional[AudioEvent]:
         L, R = frame_lr[:,0], frame_lr[:,1]
 
-        # Bandpass
-        FA_L, FA_R = sosfilt(SOS_FA, L), sosfilt(SOS_FA, R)
-        FB_L, FB_R = sosfilt(SOS_FB, L), sosfilt(SOS_FB, R)
-        G1_L, G1_R = sosfilt(SOS_G1, L), sosfilt(SOS_G1, R)
-        G2_L, G2_R = sosfilt(SOS_G2, L), sosfilt(SOS_G2, R)
+        # ---- Bandpass with persistent filter state ----
+        FA_L  = self._filt(SOS_FA,  L, 'FA_L')
+        FA_R  = self._filt(SOS_FA,  R, 'FA_R')
+        FB_L  = self._filt(SOS_FB,  L, 'FB_L')
+        FB_R  = self._filt(SOS_FB,  R, 'FB_R')
+        GLO_L = self._filt(SOS_GLO, L, 'GLO_L')
+        GLO_R = self._filt(SOS_GLO, R, 'GLO_R')
+        GHI_L = self._filt(SOS_GHI, L, 'GHI_L')
+        GHI_R = self._filt(SOS_GHI, R, 'GHI_R')
 
-        # Energies
-        e_FA = ste(np.hstack((FA_L, FA_R)))
-        e_FB = ste(np.hstack((FB_L, FB_R)))
-        e_G  = ste(np.hstack((G1_L+G2_L, G1_R+G2_R)))
-        cf   = crest(np.hstack((L, R)))
+        # ---- Per-band energies (computed correctly: sum energies, not signals) ----
+        e_FA  = (ste(FA_L)  + ste(FA_R))  / 2.0
+        e_FB  = (ste(FB_L)  + ste(FB_R))  / 2.0
+        e_GLO = (ste(GLO_L) + ste(GLO_R)) / 2.0
+        e_GHI = (ste(GHI_L) + ste(GHI_R)) / 2.0
+        e_G   = e_GLO + e_GHI   # total gun-band energy (sum of band energies)
 
-        # Update adaptive floors
-        self.stats['FA'].update(e_FA)
-        self.stats['FB'].update(e_FB)
-        self.stats['G'].update(e_G)
-
-        # Adaptive thresholds
-        th_FA = self.stats['FA'].mu + self.k_fa * self.stats['FA'].sigma
-        th_FB = self.stats['FB'].mu + self.k_fb * self.stats['FB'].sigma
-        th_G  = self.stats['G' ].mu + self.k_g  * self.stats['G' ].sigma
-
-        # Shot rejector
-        shot_like = (e_G > th_G) and (cf >= CREST_SHOT)
+        # Crest factor on the broadband signal
+        cf = crest(np.hstack((L, R)))
 
         now = time.monotonic()
 
+        # ---- Adaptive noise floor: only update when signal is NOT event-like ----
+        # We check if any band is strongly above its current floor; if so, skip update
+        # to avoid inflating the noise estimate with event energy.
+        fa_snr  = (e_FA  - self.stats['FA'].mu)  / (self.stats['FA'].sigma  + EPS)
+        fb_snr  = (e_FB  - self.stats['FB'].mu)  / (self.stats['FB'].sigma  + EPS)
+        glo_snr = (e_GLO - self.stats['GLO'].mu) / (self.stats['GLO'].sigma + EPS)
+        ghi_snr = (e_GHI - self.stats['GHI'].mu) / (self.stats['GHI'].sigma + EPS)
+
+        is_quiet = max(fa_snr, fb_snr, glo_snr, ghi_snr) < 2.0
+        if is_quiet:
+            self.stats['FA'].update(e_FA)
+            self.stats['FB'].update(e_FB)
+            self.stats['GLO'].update(e_GLO)
+            self.stats['GHI'].update(e_GHI)
+
+        # ---- Adaptive thresholds ----
+        th_FA  = self.stats['FA'].mu  + self.k_fa  * self.stats['FA'].sigma
+        th_FB  = self.stats['FB'].mu  + self.k_fb  * self.stats['FB'].sigma
+        th_GLO = self.stats['GLO'].mu + self.k_glo * self.stats['GLO'].sigma
+        th_GHI = self.stats['GHI'].mu + self.k_ghi * self.stats['GHI'].sigma
+
+        # ---- Gunshot detection ----
+        # A shot needs: (a) elevated energy in EITHER gun band, AND (b) high crest factor
+        gun_energy_hit = (e_GLO > th_GLO) or (e_GHI > th_GHI)
+        shot_like = gun_energy_hit and (cf >= CREST_SHOT)
+
+        # Also classify as shot-like if crest is very high (>= 2x threshold) even if
+        # gun band energy is only moderately above noise — catches suppressed/distant shots
+        if cf >= CREST_SHOT * 1.5 and e_G > (self.stats['GLO'].mu + self.stats['GHI'].mu) * 1.5:
+            shot_like = True
+
         if shot_like:
-            srcL, srcR = (G1_L+G2_L), (G1_R+G2_R)
+            self.last_shot_time = now
+            srcL = GLO_L + GHI_L
+            srcR = GLO_R + GHI_R
             theta, conf_dir = self._dir_from_lr(srcL, srcR)
             intensity = float(min(1.0, math.sqrt(e_G) * 60))
             confidence = float(np.clip((conf_dir*0.6) + 0.4, 0.0, 1.0))
             return AudioEvent('shot', theta, intensity, confidence, now)
 
-        # Footstep?
-        foot_hit = (e_FA > th_FA) or (e_FB > th_FB)
-        if not foot_hit:
+        # ---- Post-shot blanking: suppress footstep detection shortly after a gunshot ----
+        if (now - self.last_shot_time) < SHOT_BLANKING_S:
             return None
 
-        srcL = 0.4*FA_L + 0.6*FB_L
-        srcR = 0.4*FA_R + 0.6*FB_R
+        # ---- Footstep detection ----
+        foot_hit_A = e_FA > th_FA
+        foot_hit_B = e_FB > th_FB
+        if not (foot_hit_A or foot_hit_B):
+            return None
+
+        # ---- Spectral ratio rejection: reject if gun-band energy dominates ----
+        # Footsteps have most energy in FOOT_A (60-250 Hz); gunfire is broadband.
+        e_foot_total = e_FA + e_FB + EPS
+        if e_G / e_foot_total > GUN_FOOT_RATIO_REJECT:
+            logging.debug("Rejected footstep: gun/foot ratio %.1f > %.1f",
+                          e_G / e_foot_total, GUN_FOOT_RATIO_REJECT)
+            return None
+
+        # Additional rejection: if crest factor is high (sharp transient) and gun bands
+        # are elevated, this is likely a gunshot that didn't quite meet the shot threshold
+        if cf >= CREST_SHOT * 0.7 and gun_energy_hit:
+            logging.debug("Rejected footstep: borderline shot (crest=%.1f, gun_hit=True)", cf)
+            return None
+
+        # ---- Direction estimation ----
+        # Weight source signal toward whichever footstep band triggered
+        if foot_hit_A and foot_hit_B:
+            srcL = 0.5*FA_L + 0.5*FB_L
+            srcR = 0.5*FA_R + 0.5*FB_R
+        elif foot_hit_A:
+            srcL, srcR = FA_L, FA_R
+        else:
+            srcL, srcR = FB_L, FB_R
         theta, conf_dir = self._dir_from_lr(srcL, srcR)
 
-        # Cadence prior
+        # ---- Confidence calculation (fixed: no negative terms) ----
+        # Compute per-band excess ratio, clamped to [0, inf) before weighting
+        excess_A = max(0.0, (e_FA - th_FA) / (th_FA + EPS)) if foot_hit_A else 0.0
+        excess_B = max(0.0, (e_FB - th_FB) / (th_FB + EPS)) if foot_hit_B else 0.0
+        # Weight toward whichever band(s) actually triggered
+        if foot_hit_A and foot_hit_B:
+            conf_base = float(np.clip(0.4*excess_A + 0.6*excess_B, 0.0, 1.0))
+        elif foot_hit_A:
+            conf_base = float(np.clip(excess_A, 0.0, 1.0))
+        else:
+            conf_base = float(np.clip(excess_B, 0.0, 1.0))
+
+        # ---- Cadence prior (only update history AFTER passing all rejection checks) ----
+        conf_cad = 0.0
+        if len(self.recent_foot_times) >= 2:
+            d1 = now - self.recent_foot_times[-1]
+            d2 = self.recent_foot_times[-1] - self.recent_foot_times[-2] if len(self.recent_foot_times) >= 2 else 0
+            good1 = CAD_MIN <= d1 <= CAD_MAX
+            good2 = CAD_MIN <= d2 <= CAD_MAX
+            conf_cad = 0.2*(1.0 if good1 else 0.0) + 0.15*(1.0 if good2 else 0.0)
+            # Bonus: if both intervals are consistent (similar duration), extra confidence
+            if good1 and good2 and d2 > 0:
+                ratio = d1 / d2
+                if 0.6 <= ratio <= 1.67:  # intervals within ~60% of each other
+                    conf_cad += 0.15
+
+        # Now append to cadence history (only after all rejection gates passed)
         self.recent_foot_times.append(now)
         if len(self.recent_foot_times) > 12:
             self.recent_foot_times = self.recent_foot_times[-12:]
-        conf_cad = 0.0
-        if len(self.recent_foot_times) >= 3:
-            d1 = self.recent_foot_times[-1] - self.recent_foot_times[-2]
-            d2 = self.recent_foot_times[-2] - self.recent_foot_times[-3]
-            good1 = CAD_MIN <= d1 <= CAD_MAX
-            good2 = CAD_MIN <= d2 <= CAD_MAX
-            conf_cad = 0.25*(1.0 if good1 else 0.0) + 0.25*(1.0 if good2 else 0.0)
 
         intensity = float(np.clip(np.sqrt(0.4*e_FA + 0.6*e_FB) * 70, 0.0, 1.0))
-        conf_base = float(np.clip(((e_FA - th_FA)/(th_FA+EPS))*0.4 + ((e_FB - th_FB)/(th_FB+EPS))*0.6, 0, 1))
-        confidence = float(np.clip(0.5*conf_base + 0.25*conf_dir + conf_cad, 0.0, 1.0))
+        confidence = float(np.clip(0.45*conf_base + 0.25*conf_dir + conf_cad, 0.0, 1.0))
         return AudioEvent('footstep', theta, intensity, confidence, now)
 
 # =========================
@@ -953,7 +1057,9 @@ def main():
                         on_frame._t0 = time.monotonic()
                 if evt and evt.confidence >= args.min_confidence:
                     state.push(evt)
-                    logging.debug(f"{evt.cls:8s} az={math.degrees(evt.theta):+05.1f}° I={evt.intensity:.2f} C={evt.confidence:.2f}")
+                    lvl = logging.INFO if args.debug_audio else logging.DEBUG
+                    logging.log(lvl, "%8s az=%+05.1f° I=%.2f C=%.2f",
+                                evt.cls, math.degrees(evt.theta), evt.intensity, evt.confidence)
             try:
                 audio.start(on_frame)
                 break  # success
@@ -1010,7 +1116,9 @@ def main():
                 on_frame._t0 = time.monotonic()
         if evt and evt.confidence >= args.min_confidence:
             state.push(evt)
-            logging.debug(f"{evt.cls:8s} az={math.degrees(evt.theta):+05.1f}° I={evt.intensity:.2f} C={evt.confidence:.2f}")
+            lvl = logging.INFO if args.debug_audio else logging.DEBUG
+            logging.log(lvl, "%8s az=%+05.1f° I=%.2f C=%.2f",
+                        evt.cls, math.degrees(evt.theta), evt.intensity, evt.confidence)
 
     # Start audio
     audio.start(on_frame)
