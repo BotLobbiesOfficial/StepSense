@@ -246,7 +246,7 @@ class EventDetector:
         gun_energy_hit = (e_GLO > th_GLO) or (e_GHI > th_GHI)
         shot_like = gun_energy_hit and (cf >= CREST_SHOT)
 
-        # Also classify as shot-like if crest is very high (>= 2x threshold) even if
+        # Also classify as shot-like if crest is very high (>= 1.5x threshold) even if
         # gun band energy is only moderately above noise — catches suppressed/distant shots
         if cf >= CREST_SHOT * 1.5 and e_G > (self.stats['GLO'].mu + self.stats['GHI'].mu) * 1.5:
             shot_like = True
@@ -311,7 +311,7 @@ class EventDetector:
         conf_cad = 0.0
         if len(self.recent_foot_times) >= 2:
             d1 = now - self.recent_foot_times[-1]
-            d2 = self.recent_foot_times[-1] - self.recent_foot_times[-2] if len(self.recent_foot_times) >= 2 else 0
+            d2 = self.recent_foot_times[-1] - self.recent_foot_times[-2]
             good1 = CAD_MIN <= d1 <= CAD_MAX
             good2 = CAD_MIN <= d2 <= CAD_MAX
             conf_cad = 0.2*(1.0 if good1 else 0.0) + 0.15*(1.0 if good2 else 0.0)
@@ -442,6 +442,7 @@ if WINDOWS_AUDIO_AVAILABLE:
             self.pyaudio_instance = None
             self.stream = None
             self.audio_queue = queue.Queue(maxsize=100)
+            self._stream_channels = 2  # actual channel count of the opened stream
 
         def _find_wasapi_loopback_device(self):
             """Find WASAPI loopback device using PyAudioWPatch."""
@@ -509,14 +510,17 @@ if WINDOWS_AUDIO_AVAILABLE:
             try:
                 # Convert captured loopback audio to numpy array
                 audio_data = np.frombuffer(in_data, dtype=np.float32)
+                ch = self._stream_channels
 
-                # Reshape based on channels
-                if len(audio_data) == frame_count:
-                    # Mono - convert to stereo
-                    audio_data = np.repeat(audio_data.reshape(-1, 1), 2, axis=1)
-                else:
-                    # Stereo
-                    audio_data = audio_data.reshape(-1, 2)
+                # Reshape to (frames, channels) using known channel count
+                audio_data = audio_data.reshape(-1, ch)
+
+                if ch == 1:
+                    # Mono -> duplicate to stereo
+                    audio_data = np.repeat(audio_data, 2, axis=1)
+                elif ch > 2:
+                    # Multi-channel (5.1/7.1) -> take first two channels (L/R)
+                    audio_data = audio_data[:, :2].copy()
 
                 # Queue for processing
                 try:
@@ -569,9 +573,10 @@ if WINDOWS_AUDIO_AVAILABLE:
 
             try:
                 # Open WASAPI loopback stream using PyAudioWPatch
+                self._stream_channels = int(device_info['maxInputChannels'])
                 self.stream = self.pyaudio_instance.open(
                     format=pyaudio_wpatch.paFloat32,
-                    channels=int(device_info['maxInputChannels']),
+                    channels=self._stream_channels,
                     rate=int(device_info['defaultSampleRate']),
                     input=True,
                     input_device_index=device_info['index'],
