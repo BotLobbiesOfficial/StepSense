@@ -68,7 +68,13 @@ GUN_2  = (1200, 5000)
 TH_K_FA = 3.0
 TH_K_FB = 2.5
 TH_K_G  = 3.5
-CREST_SHOT = 8.0
+CREST_SHOT_HARD = 8.0        # definite gunshot
+CREST_SHOT_SOFT = 5.0        # probable gunshot (distant / compressed)
+
+# Shot-footstep discrimination
+SHOT_SUPPRESS_S  = 0.15      # suppress footsteps for 150 ms after a shot
+GUN_FOOT_RATIO   = 3.0       # if gunshot-band energy ≥ 3× footstep-band → reject as gunfire bleed
+SPECTRAL_FLAT_TH = 0.55      # spectral flatness above this → broadband (gunshot-like)
 
 # Cadence (seconds between steps)
 CAD_MIN = 0.12
@@ -147,6 +153,7 @@ class EventDetector:
             'G' : RollingStats(),
         }
         self.recent_foot_times: List[float] = []
+        self.last_shot_time: float = 0.0   # for post-shot suppression
         # Lower K -> more sensitive; scale Ks by 1/sensitivity
         s = max(sensitivity, 1e-3)
         self.k_fa = TH_K_FA / s
@@ -162,6 +169,14 @@ class EventDetector:
         theta = 0.65*theta_itd + 0.35*theta_ild
         conf_dir = float(np.clip(cc/8.0, 0.0, 1.0))
         return theta, conf_dir
+
+    def _spectral_flatness(self, energies: List[float]) -> float:
+        """Ratio of geometric mean to arithmetic mean of band energies.
+        Close to 1.0 = broadband (gunshot-like), close to 0.0 = narrowband (footstep-like)."""
+        arr = np.array([max(e, EPS) for e in energies])
+        geo = np.exp(np.mean(np.log(arr)))
+        ari = np.mean(arr)
+        return float(geo / (ari + EPS))
 
     def detect(self, frame_lr: np.ndarray) -> Optional[AudioEvent]:
         L, R = frame_lr[:,0], frame_lr[:,1]
@@ -188,21 +203,48 @@ class EventDetector:
         th_FB = self.stats['FB'].mu + self.k_fb * self.stats['FB'].sigma
         th_G  = self.stats['G' ].mu + self.k_g  * self.stats['G' ].sigma
 
-        # Shot rejector
-        shot_like = (e_G > th_G) and (cf >= CREST_SHOT)
-
         now = time.monotonic()
 
-        if shot_like:
+        # --- Shot detection (two-tier: hard and soft crest thresholds) ---
+        hard_shot = (e_G > th_G) and (cf >= CREST_SHOT_HARD)
+        soft_shot = (e_G > th_G) and (cf >= CREST_SHOT_SOFT) and not hard_shot
+
+        # Spectral flatness across all bands — gunshots excite everything
+        sf = self._spectral_flatness([e_FA, e_FB, e_G])
+
+        if hard_shot or (soft_shot and sf > SPECTRAL_FLAT_TH):
+            self.last_shot_time = now
+            # Clear cadence history — shot reverb contaminates step timing
+            self.recent_foot_times.clear()
+
             srcL, srcR = (G1_L+G2_L), (G1_R+G2_R)
             theta, conf_dir = self._dir_from_lr(srcL, srcR)
             intensity = float(min(1.0, math.sqrt(e_G) * 60))
             confidence = float(np.clip((conf_dir*0.6) + 0.4, 0.0, 1.0))
+            # Slightly lower confidence for soft-shot detections
+            if soft_shot:
+                confidence *= 0.8
             return AudioEvent('shot', theta, intensity, confidence, now)
 
-        # Footstep?
+        # --- Post-shot suppression: ignore footstep candidates shortly after a shot ---
+        if (now - self.last_shot_time) < SHOT_SUPPRESS_S:
+            return None
+
+        # --- Footstep candidate gate ---
         foot_hit = (e_FA > th_FA) or (e_FB > th_FB)
         if not foot_hit:
+            return None
+
+        # Cross-band energy ratio guard: if gunshot bands dominate, this is
+        # likely gunfire bleed that didn't trigger the shot detector
+        e_foot = 0.4 * e_FA + 0.6 * e_FB
+        if e_G > GUN_FOOT_RATIO * e_foot and e_G > th_G * 0.7:
+            logging.debug("Rejected footstep candidate: gun-band energy %.2e >> foot-band %.2e", e_G, e_foot)
+            return None
+
+        # Spectral flatness guard: broadband energy bursts are not footsteps
+        if sf > SPECTRAL_FLAT_TH and cf > CREST_SHOT_SOFT * 0.8:
+            logging.debug("Rejected footstep candidate: spectral flatness %.2f with crest %.1f", sf, cf)
             return None
 
         srcL = 0.4*FA_L + 0.6*FB_L
@@ -221,7 +263,7 @@ class EventDetector:
             good2 = CAD_MIN <= d2 <= CAD_MAX
             conf_cad = 0.25*(1.0 if good1 else 0.0) + 0.25*(1.0 if good2 else 0.0)
 
-        intensity = float(np.clip(np.sqrt(0.4*e_FA + 0.6*e_FB) * 70, 0.0, 1.0))
+        intensity = float(np.clip(np.sqrt(e_foot) * 70, 0.0, 1.0))
         conf_base = float(np.clip(((e_FA - th_FA)/(th_FA+EPS))*0.4 + ((e_FB - th_FB)/(th_FB+EPS))*0.6, 0, 1))
         confidence = float(np.clip(0.5*conf_base + 0.25*conf_dir + conf_cad, 0.0, 1.0))
         return AudioEvent('footstep', theta, intensity, confidence, now)
