@@ -81,10 +81,11 @@ SHOT_SUPPRESS_S  = 0.15      # suppress footsteps for 150 ms after a shot
 GUN_FOOT_RATIO   = 3.0       # if gunshot-band energy ≥ 3× footstep-band → reject as gunfire bleed
 SPECTRAL_FLAT_TH = 0.55      # spectral flatness above this → broadband (gunshot-like)
 
-# Cadence (seconds between steps) — covers tac-sprint (~215ms) through slow walk (~400ms)
+# Cadence (seconds between steps) — covers tac-sprint (~200ms) through slow walk/ADS (~600ms)
 # Source: biomechanics data mapped to CoD movement speeds
-CAD_MIN = 0.12
-CAD_MAX = 0.45
+# Tac-sprint: ~200-280ms | Sprint: ~250-333ms | Run: ~375-430ms | Walk/ADS: ~500-600ms
+CAD_MIN = 0.15
+CAD_MAX = 0.60
 
 # UI
 UI_FPS = 60
