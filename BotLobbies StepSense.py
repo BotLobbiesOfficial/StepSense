@@ -820,6 +820,38 @@ class AudioLoop:
                                 continue
             return False
 
+        # --- Fallback chain if primary device fails ---
+        def try_stereo_mix() -> bool:
+            """Try opening 'Stereo Mix' input device as fallback."""
+            if not self.allow_input_fallback:
+                return False
+            try:
+                devs = sd.query_devices()
+                stereo_idx = next((i for i, d in enumerate(devs)
+                                   if d.get('max_input_channels', 0) > 0 and 'stereo mix' in d['name'].lower()), None)
+            except Exception:
+                stereo_idx = None
+            if stereo_idx is not None and try_open_on_device(stereo_idx):
+                logging.warning("Fell back to 'Stereo Mix' input device index %s", stereo_idx)
+                return True
+            return False
+
+        def try_windows_capture(on_frame_cb) -> bool:
+            """Try PyAudioWPatch WASAPI loopback as last-resort fallback."""
+            if not WINDOWS_AUDIO_AVAILABLE or self.device_index is None:
+                return False
+            try:
+                caps = sd.query_devices(self.device_index)
+                name = caps.get('name', '')
+                logging.info("Attempting Windows Core Audio fallback for device: %s", name)
+                self.windows_capture = WindowsLoopbackCapture(name, self.fs, self.hop, self.win)
+                self.windows_capture.start(on_frame_cb)
+                logging.info("Successfully started Windows Core Audio fallback")
+                return True
+            except Exception as e:
+                logging.error("Windows Core Audio fallback failed: %s", e)
+                return False
+
         if not try_open_on_device(dev_out):
             # Fallback: try default WASAPI output device
             try:
@@ -828,64 +860,21 @@ class AudioLoop:
                 dev_default = sd.query_hostapis(wasapi_idx)['default_output_device']
             except Exception:
                 dev_default = None
+
+            opened = False
             if dev_default is not None and dev_default != dev_out:
                 logging.warning("Primary device failed; trying default WASAPI output device index %s", dev_default)
-                if not try_open_on_device(dev_default):
-                    if self.allow_input_fallback:
-                        # As a last resort, try any 'Stereo Mix' input device if present
-                        try:
-                            devs = sd.query_devices()
-                            stereo_idx = next((i for i, d in enumerate(devs)
-                                               if d.get('max_input_channels', 0) > 0 and 'stereo mix' in d['name'].lower()), None)
-                        except Exception:
-                            stereo_idx = None
-                        if stereo_idx is not None and try_open_on_device(stereo_idx):
-                            logging.warning("Fell back to 'Stereo Mix' input device index %s", stereo_idx)
-                        else:
-                            raise RuntimeError("Failed to open loopback stream on the selected device and the default WASAPI output. Run with --list-outputs and choose the '(loopback)' entry or pass --use-loopback-alias; you can also enable --allow-input-fallback.")
-                    else:
-                        raise RuntimeError("Failed to open loopback stream on the selected device and the default WASAPI output. Run with --list-outputs and choose the '(loopback)' entry or pass --use-loopback-alias; you can also enable --allow-input-fallback.")
-            else:
-                if self.allow_input_fallback:
-                    # Try 'Stereo Mix' if available
-                    try:
-                        devs = sd.query_devices()
-                        stereo_idx = next((i for i, d in enumerate(devs)
-                                           if d.get('max_input_channels', 0) > 0 and 'stereo mix' in d['name'].lower()), None)
-                    except Exception:
-                        stereo_idx = None
-                    if stereo_idx is not None and try_open_on_device(stereo_idx):
-                        logging.warning("Fell back to 'Stereo Mix' input device index %s", stereo_idx)
-                    else:
-                        # Try Windows Core Audio fallback as last resort
-                        if WINDOWS_AUDIO_AVAILABLE and self.device_index is not None:
-                            try:
-                                device_caps = sd.query_devices(self.device_index)
-                                device_name = device_caps.get('name', '')
-                                logging.info("Attempting Windows Core Audio fallback for device: %s", device_name)
-                                self.windows_capture = WindowsLoopbackCapture(device_name, self.fs, self.hop, self.win)
-                                self.windows_capture.start(on_frame)
-                                logging.info("Successfully started Windows Core Audio fallback")
-                                return
-                            except Exception as e:
-                                logging.error("Windows Core Audio fallback failed: %s", e)
+                opened = try_open_on_device(dev_default)
 
-                        raise RuntimeError("Failed to open a loopback stream on the selected device. Run with --list-outputs and choose the '(loopback)' entry or pass --use-loopback-alias; you can also enable --allow-input-fallback.")
-                else:
-                    # Try Windows Core Audio fallback as last resort
-                    if WINDOWS_AUDIO_AVAILABLE and self.device_index is not None:
-                        try:
-                            device_caps = sd.query_devices(self.device_index)
-                            device_name = device_caps.get('name', '')
-                            logging.info("Attempting Windows Core Audio fallback for device: %s", device_name)
-                            self.windows_capture = WindowsLoopbackCapture(device_name, self.fs, self.hop, self.win)
-                            self.windows_capture.start(on_frame)
-                            logging.info("Successfully started Windows Core Audio fallback")
-                            return
-                        except Exception as e:
-                            logging.error("Windows Core Audio fallback failed: %s", e)
+            if not opened:
+                opened = try_stereo_mix() or try_windows_capture(on_frame)
 
-                    raise RuntimeError("Failed to open a loopback stream on the selected device. Run with --list-outputs and choose the '(loopback)' entry or pass --use-loopback-alias; you can also enable --allow-input-fallback.")
+            if not opened:
+                raise RuntimeError("Failed to open a loopback stream on the selected device. "
+                                   "Run with --list-outputs and choose the '(loopback)' entry or "
+                                   "pass --use-loopback-alias; you can also enable --allow-input-fallback.")
+            if self.windows_capture:
+                return  # capture running via WindowsLoopbackCapture, skip worker thread
 
         # worker: build 20 ms window, slide by 10 ms
         buf = np.zeros((self.win, 2), dtype=np.float32)
@@ -1009,83 +998,12 @@ def choose_device_interactive() -> Optional[int]:
         return None
     return idx
 
-def main():
-    args = build_parser().parse_args()
-    logging.basicConfig(level=getattr(logging, args.loglevel.upper(), logging.INFO),
-                        format="%(asctime)s %(levelname)s: %(message)s")
-
-    if args.choose_device:
-        # Interactive selection with retry if stream open fails
-        while True:
-            idx = choose_device_interactive()
-            if idx is None:
-                return
-            args.device = idx
-            detector = EventDetector(sensitivity=args.sensitivity)
-            state = EventState()
-            audio = AudioLoop(device_index=args.device, allow_input_fallback=args.allow_input_fallback, force_loopback_alias=args.use_loopback_alias)
-
-            def on_frame(frame_lr):
-                evt = detector.detect(frame_lr)
-                if args.debug_audio:
-                    # Lightweight RMS meter every ~0.5s
-                    if not hasattr(on_frame, "_acc"):
-                        on_frame._acc = 0
-                        on_frame._t0 = time.monotonic()
-                    on_frame._acc += float(np.sqrt(np.mean(frame_lr**2)))
-                    if (time.monotonic() - on_frame._t0) >= 0.5:
-                        rms = on_frame._acc / max(1, int(0.5/(HOP/FS)))
-                        logging.info("AUDIO RMS ~ %.4f", rms)
-                        on_frame._acc = 0
-                        on_frame._t0 = time.monotonic()
-                if evt and evt.confidence >= args.min_confidence:
-                    state.push(evt)
-                    logging.debug(f"{evt.cls:8s} az={math.degrees(evt.theta):+05.1f}° I={evt.intensity:.2f} C={evt.confidence:.2f}")
-            try:
-                audio.start(on_frame)
-                break  # success
-            except Exception as e:
-                logging.error("Failed to open device %s: %s", idx, e)
-                print("\nCould not open that device. Please choose another output device.\n")
-                continue
-        # proceed with overlay/headless using objects created above
-        # Overlay or headless
-        if args.no_overlay or not PYSIDE:
-            if not PYSIDE and not args.no_overlay:
-                logging.warning("PySide6 not available; running headless (no overlay).")
-            print("Running… Press Ctrl+C to quit.")
-            try:
-                while True:
-                    time.sleep(1.0)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                audio.stop()
-                return
-
-        app = QtWidgets.QApplication([])
-        overlay = CompassOverlay(state)
-        try:
-            app.exec()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            audio.stop()
-        return
-    elif args.list_outputs:
-        list_output_devices()
-        return
-    elif args.list_devices:
-        list_devices()
-        return
-
-    detector = EventDetector(sensitivity=args.sensitivity)
-    state = EventState()
-    audio = AudioLoop(device_index=args.device, allow_input_fallback=args.allow_input_fallback, force_loopback_alias=args.use_loopback_alias)
-
+def make_on_frame(detector, state, args):
+    """Build the per-frame audio callback. Shared by --choose-device and normal paths."""
     def on_frame(frame_lr):
         evt = detector.detect(frame_lr)
         if args.debug_audio:
+            # Lightweight RMS meter every ~0.5s
             if not hasattr(on_frame, "_acc"):
                 on_frame._acc = 0
                 on_frame._t0 = time.monotonic()
@@ -1098,11 +1016,10 @@ def main():
         if evt and evt.confidence >= args.min_confidence:
             state.push(evt)
             logging.debug(f"{evt.cls:8s} az={math.degrees(evt.theta):+05.1f}° I={evt.intensity:.2f} C={evt.confidence:.2f}")
+    return on_frame
 
-    # Start audio
-    audio.start(on_frame)
-
-    # Overlay or headless
+def run_event_loop(audio, state, args):
+    """Run the overlay (or headless) event loop, then clean up audio on exit."""
     if args.no_overlay or not PYSIDE:
         if not PYSIDE and not args.no_overlay:
             logging.warning("PySide6 not available; running headless (no overlay).")
@@ -1114,9 +1031,8 @@ def main():
             pass
         finally:
             audio.stop()
-            return
+        return
 
-    # Qt overlay loop
     app = QtWidgets.QApplication([])
     overlay = CompassOverlay(state)
     try:
@@ -1125,6 +1041,45 @@ def main():
         pass
     finally:
         audio.stop()
+
+def main():
+    args = build_parser().parse_args()
+    logging.basicConfig(level=getattr(logging, args.loglevel.upper(), logging.INFO),
+                        format="%(asctime)s %(levelname)s: %(message)s")
+
+    if args.list_outputs:
+        list_output_devices()
+        return
+    if args.list_devices:
+        list_devices()
+        return
+
+    if args.choose_device:
+        # Interactive selection with retry if stream open fails
+        while True:
+            idx = choose_device_interactive()
+            if idx is None:
+                return
+            args.device = idx
+            detector = EventDetector(sensitivity=args.sensitivity)
+            state = EventState()
+            audio = AudioLoop(device_index=args.device, allow_input_fallback=args.allow_input_fallback, force_loopback_alias=args.use_loopback_alias)
+            on_frame = make_on_frame(detector, state, args)
+            try:
+                audio.start(on_frame)
+                break  # success
+            except Exception as e:
+                logging.error("Failed to open device %s: %s", idx, e)
+                print("\nCould not open that device. Please choose another output device.\n")
+                continue
+    else:
+        detector = EventDetector(sensitivity=args.sensitivity)
+        state = EventState()
+        audio = AudioLoop(device_index=args.device, allow_input_fallback=args.allow_input_fallback, force_loopback_alias=args.use_loopback_alias)
+        on_frame = make_on_frame(detector, state, args)
+        audio.start(on_frame)
+
+    run_event_loop(audio, state, args)
 
 if __name__ == "__main__":
     main()
