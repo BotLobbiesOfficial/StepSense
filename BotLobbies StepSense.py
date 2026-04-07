@@ -3,8 +3,8 @@
 """
 Audio→Visual Compass for COD/Warzone (stereo path) — No Haptics
 - WASAPI loopback capture (sounddevice)
-- Footstep detection (dual-band: 60–250 Hz + 1–4 kHz) with adaptive thresholds + cadence prior
-- Gunshot detection (crest/decay guard)
+- Footstep detection (dual-band: 100–450 Hz + 1–4 kHz) with adaptive thresholds + cadence prior
+- Gunshot detection (crest/decay guard + spectral flatness + 2 kHz peak discrimination)
 - Direction via GCC-PHAT + ILD fusion
 - Overlay: transparent radial ring (PySide6)
 
@@ -28,14 +28,8 @@ import numpy as np
 import sounddevice as sd
 from scipy.signal import butter, sosfilt
 
-# Windows-specific audio capture
+# Windows-specific audio capture (PyAudioWPatch for WASAPI loopback)
 try:
-    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-    from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize, GUID, IUnknown
-    import comtypes.client
-    import ctypes
-    from ctypes import wintypes, windll, POINTER, Structure, c_uint32, c_void_p, c_long
-    import pyaudio
     import pyaudiowpatch as pyaudio_wpatch
     WINDOWS_AUDIO_AVAILABLE = True
 except ImportError:
@@ -256,7 +250,7 @@ class EventDetector:
         # for a cleaner comparison against gun-band energy.
         e_foot_clean = 0.4 * e_FA + 0.6 * e_FP
         if e_G > GUN_FOOT_RATIO * e_foot_clean and e_G > th_G * 0.7:
-            logging.debug("Rejected footstep candidate: gun-band energy %.2e >> foot-band %.2e", e_G, e_foot)
+            logging.debug("Rejected footstep candidate: gun-band energy %.2e >> foot-band %.2e", e_G, e_foot_clean)
             return None
 
         # Spectral flatness guard: broadband energy bursts are not footsteps
@@ -289,6 +283,7 @@ class EventDetector:
             good2 = CAD_MIN <= d2 <= CAD_MAX
             conf_cad = 0.25*(1.0 if good1 else 0.0) + 0.25*(1.0 if good2 else 0.0)
 
+        e_foot = 0.4 * e_FA + 0.6 * e_FB
         intensity = float(np.clip(np.sqrt(e_foot) * 70, 0.0, 1.0))
         # Per-band excess ratios — clamp each to [0,1] individually so a non-triggering
         # band doesn't subtract from confidence (fixes metal/concrete footsteps weak in Band A)
@@ -469,6 +464,7 @@ if WINDOWS_AUDIO_AVAILABLE:
 
                     if not loopback_device:
                         logging.error("No loopback device found for: %s", target_speakers['name'])
+                        p.terminate()
                         return None, None
                 else:
                     loopback_device = target_speakers
@@ -479,6 +475,10 @@ if WINDOWS_AUDIO_AVAILABLE:
 
             except Exception as e:
                 logging.error("Error finding WASAPI device: %s", e)
+                try:
+                    p.terminate()  # noqa: F821 — p may not be bound if PyAudio() itself failed
+                except (NameError, UnboundLocalError, Exception):
+                    pass
                 return None, None
 
         def _audio_callback(self, in_data, frame_count, time_info, status):
@@ -490,13 +490,16 @@ if WINDOWS_AUDIO_AVAILABLE:
                 # Convert captured loopback audio to numpy array
                 audio_data = np.frombuffer(in_data, dtype=np.float32)
 
-                # Reshape based on channels
-                if len(audio_data) == frame_count:
-                    # Mono - convert to stereo
+                # Reshape based on channels (handle mono, stereo, and surround)
+                n_channels = len(audio_data) // frame_count if frame_count > 0 else 1
+                if n_channels <= 1:
+                    # Mono - duplicate to stereo
                     audio_data = np.repeat(audio_data.reshape(-1, 1), 2, axis=1)
-                else:
-                    # Stereo
+                elif n_channels == 2:
                     audio_data = audio_data.reshape(-1, 2)
+                else:
+                    # Surround (5.1, 7.1, etc.) - take first two channels (L/R)
+                    audio_data = audio_data.reshape(-1, n_channels)[:, :2]
 
                 # Queue for processing
                 try:
