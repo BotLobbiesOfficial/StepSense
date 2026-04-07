@@ -166,7 +166,7 @@ class EventDetector:
             'G' : RollingStats(),
         }
         self.recent_foot_times: List[float] = []
-        self.last_shot_time: float = 0.0   # for post-shot suppression
+        self.last_shot_time: float = -1.0  # sentinel: no shot has occurred yet
         # Lower K -> more sensitive; scale Ks by 1/sensitivity
         s = max(sensitivity, 1e-3)
         self.k_fa = TH_K_FA / s
@@ -251,9 +251,11 @@ class EventDetector:
             return None
 
         # Cross-band energy ratio guard: if gunshot bands dominate, this is
-        # likely gunfire bleed that didn't trigger the shot detector
-        e_foot = 0.4 * e_FA + 0.6 * e_FB
-        if e_G > GUN_FOOT_RATIO * e_foot and e_G > th_G * 0.7:
+        # likely gunfire bleed that didn't trigger the shot detector.
+        # Use e_FP (1.5-3 kHz, no gun overlap) instead of e_FB (1-4 kHz, partial overlap)
+        # for a cleaner comparison against gun-band energy.
+        e_foot_clean = 0.4 * e_FA + 0.6 * e_FP
+        if e_G > GUN_FOOT_RATIO * e_foot_clean and e_G > th_G * 0.7:
             logging.debug("Rejected footstep candidate: gun-band energy %.2e >> foot-band %.2e", e_G, e_foot)
             return None
 
@@ -277,26 +279,35 @@ class EventDetector:
         srcR = 0.4*FA_R + 0.6*FB_R
         theta, conf_dir = self._dir_from_lr(srcL, srcR)
 
-        # Cadence prior
-        self.recent_foot_times.append(now)
-        if len(self.recent_foot_times) > 12:
-            self.recent_foot_times = self.recent_foot_times[-12:]
+        # Cadence prior — check timing BEFORE appending, so we evaluate against
+        # previously confirmed footsteps rather than self-reinforcing marginal detections
         conf_cad = 0.0
-        if len(self.recent_foot_times) >= 3:
-            d1 = self.recent_foot_times[-1] - self.recent_foot_times[-2]
-            d2 = self.recent_foot_times[-2] - self.recent_foot_times[-3]
+        if len(self.recent_foot_times) >= 2:
+            d1 = now - self.recent_foot_times[-1]
+            d2 = self.recent_foot_times[-1] - self.recent_foot_times[-2]
             good1 = CAD_MIN <= d1 <= CAD_MAX
             good2 = CAD_MIN <= d2 <= CAD_MAX
             conf_cad = 0.25*(1.0 if good1 else 0.0) + 0.25*(1.0 if good2 else 0.0)
 
         intensity = float(np.clip(np.sqrt(e_foot) * 70, 0.0, 1.0))
-        conf_base = float(np.clip(((e_FA - th_FA)/(th_FA+EPS))*0.4 + ((e_FB - th_FB)/(th_FB+EPS))*0.6, 0, 1))
+        # Per-band excess ratios — clamp each to [0,1] individually so a non-triggering
+        # band doesn't subtract from confidence (fixes metal/concrete footsteps weak in Band A)
+        excess_a = float(np.clip((e_FA - th_FA) / (th_FA + EPS), 0, 1))
+        excess_b = float(np.clip((e_FB - th_FB) / (th_FB + EPS), 0, 1))
+        conf_base = 0.4 * excess_a + 0.6 * excess_b
 
         # Boost confidence when energy is concentrated around 2 kHz (footstep-like)
         peak_ratio = e_FP / (e_FB + EPS) if e_FB > EPS else 0.0
         conf_peak = float(np.clip(peak_ratio * 0.3, 0.0, 0.15))  # up to +0.15 bonus
 
         confidence = float(np.clip(0.45*conf_base + 0.25*conf_dir + conf_peak + conf_cad, 0.0, 1.0))
+
+        # Record this footstep in cadence history AFTER computing confidence,
+        # so only emitted events influence future cadence scoring
+        self.recent_foot_times.append(now)
+        if len(self.recent_foot_times) > 12:
+            self.recent_foot_times = self.recent_foot_times[-12:]
+
         return AudioEvent('footstep', theta, intensity, confidence, now)
 
 # =========================
