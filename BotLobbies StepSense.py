@@ -58,9 +58,14 @@ EPS = 1e-12
 EAR_DIST = 0.18           # ~18 cm ear spacing
 SPEED_SOUND = 343.0
 
-# Bands (Warzone-tuned)
-FOOT_A = (60, 250)        # impact / heel
-FOOT_B = (1000, 4000)     # tread / scrape (often mixed hotter)
+# Bands (Warzone / Black Ops tuned from community spectral analysis)
+# Footstep "body" zone: 100-450 Hz — heel impact, gear resonance, hollow-surface boom
+# Sources: ExpertBeacon, ArtIsWarTools, SteelSeries Sonar community EQ data
+FOOT_A = (100, 450)
+# Footstep "texture" zone: 1-4 kHz — tread scrape, gravel crunch, metal ring
+# 2 kHz is the single most critical frequency for footstep detection per community consensus
+FOOT_B = (1000, 4000)
+# Gunshot bands: 300-5 kHz broadband, peak at 900-1500 Hz
 GUN_1  = (300, 1200)
 GUN_2  = (1200, 5000)
 
@@ -68,15 +73,16 @@ GUN_2  = (1200, 5000)
 TH_K_FA = 3.0
 TH_K_FB = 2.5
 TH_K_G  = 3.5
-CREST_SHOT_HARD = 8.0        # definite gunshot
-CREST_SHOT_SOFT = 5.0        # probable gunshot (distant / compressed)
+CREST_SHOT_HARD = 8.0        # definite gunshot (sharp transient)
+CREST_SHOT_SOFT = 5.0        # probable gunshot (distant / compressed / suppressed)
 
 # Shot-footstep discrimination
 SHOT_SUPPRESS_S  = 0.15      # suppress footsteps for 150 ms after a shot
 GUN_FOOT_RATIO   = 3.0       # if gunshot-band energy ≥ 3× footstep-band → reject as gunfire bleed
 SPECTRAL_FLAT_TH = 0.55      # spectral flatness above this → broadband (gunshot-like)
 
-# Cadence (seconds between steps)
+# Cadence (seconds between steps) — covers tac-sprint (~215ms) through slow walk (~400ms)
+# Source: biomechanics data mapped to CoD movement speeds
 CAD_MIN = 0.12
 CAD_MAX = 0.45
 
@@ -96,6 +102,12 @@ SOS_FA = band_sos(*FOOT_A)
 SOS_FB = band_sos(*FOOT_B)
 SOS_G1 = band_sos(*GUN_1)
 SOS_G2 = band_sos(*GUN_2)
+
+# Narrow sub-band around 2 kHz — the footstep "sweet spot" per community analysis.
+# Footsteps peak here; gunshots pass through but don't concentrate here.
+# Used as a discriminator: high e_FPEAK / e_FB ratio = likely footstep.
+FOOT_PEAK = (1500, 3000)
+SOS_FP = band_sos(*FOOT_PEAK)
 
 def ste(x): 
     return float(np.mean(x**2))
@@ -184,12 +196,14 @@ class EventDetector:
         # Bandpass
         FA_L, FA_R = sosfilt(SOS_FA, L), sosfilt(SOS_FA, R)
         FB_L, FB_R = sosfilt(SOS_FB, L), sosfilt(SOS_FB, R)
+        FP_L, FP_R = sosfilt(SOS_FP, L), sosfilt(SOS_FP, R)   # 2 kHz peak sub-band
         G1_L, G1_R = sosfilt(SOS_G1, L), sosfilt(SOS_G1, R)
         G2_L, G2_R = sosfilt(SOS_G2, L), sosfilt(SOS_G2, R)
 
         # Energies
         e_FA = ste(np.hstack((FA_L, FA_R)))
         e_FB = ste(np.hstack((FB_L, FB_R)))
+        e_FP = ste(np.hstack((FP_L, FP_R)))   # footstep peak sub-band energy
         e_G  = ste(np.hstack((G1_L+G2_L, G1_R+G2_R)))
         cf   = crest(np.hstack((L, R)))
 
@@ -247,6 +261,17 @@ class EventDetector:
             logging.debug("Rejected footstep candidate: spectral flatness %.2f with crest %.1f", sf, cf)
             return None
 
+        # 2 kHz peak concentration check: real footsteps concentrate energy in the
+        # 1.5-3 kHz sub-band. If Band B is hot but the 2 kHz peak isn't dominant,
+        # the energy is likely gunshot bleed spread across 1-5 kHz.
+        if e_FB > th_FB and e_FP > EPS:
+            peak_ratio = e_FP / (e_FB + EPS)
+            # Footsteps: peak_ratio typically > 0.4 (energy concentrated near 2 kHz)
+            # Gunshots: peak_ratio typically < 0.3 (energy spread across full 1-5 kHz)
+            if peak_ratio < 0.20 and e_G > th_G * 0.5:
+                logging.debug("Rejected footstep: low 2kHz peak ratio %.2f (gun-like spread)", peak_ratio)
+                return None
+
         srcL = 0.4*FA_L + 0.6*FB_L
         srcR = 0.4*FA_R + 0.6*FB_R
         theta, conf_dir = self._dir_from_lr(srcL, srcR)
@@ -265,7 +290,12 @@ class EventDetector:
 
         intensity = float(np.clip(np.sqrt(e_foot) * 70, 0.0, 1.0))
         conf_base = float(np.clip(((e_FA - th_FA)/(th_FA+EPS))*0.4 + ((e_FB - th_FB)/(th_FB+EPS))*0.6, 0, 1))
-        confidence = float(np.clip(0.5*conf_base + 0.25*conf_dir + conf_cad, 0.0, 1.0))
+
+        # Boost confidence when energy is concentrated around 2 kHz (footstep-like)
+        peak_ratio = e_FP / (e_FB + EPS) if e_FB > EPS else 0.0
+        conf_peak = float(np.clip(peak_ratio * 0.3, 0.0, 0.15))  # up to +0.15 bonus
+
+        confidence = float(np.clip(0.45*conf_base + 0.25*conf_dir + conf_peak + conf_cad, 0.0, 1.0))
         return AudioEvent('footstep', theta, intensity, confidence, now)
 
 # =========================
