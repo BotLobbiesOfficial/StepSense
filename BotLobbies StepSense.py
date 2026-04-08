@@ -71,7 +71,8 @@ CREST_SHOT_HARD = 8.0        # definite gunshot (sharp transient)
 CREST_SHOT_SOFT = 5.0        # probable gunshot (distant / compressed / suppressed)
 
 # Shot-footstep discrimination
-SHOT_SUPPRESS_S  = 0.15      # suppress footsteps for 150 ms after a shot
+SHOT_SUPPRESS_MIN = 0.12     # minimum suppression after any shot (120 ms)
+SHOT_SUPPRESS_MAX = 0.35     # maximum suppression for loud/close shots (350 ms, covers indoor reverb)
 GUN_FOOT_RATIO   = 3.0       # if gunshot-band energy ≥ 3× footstep-band → reject as gunfire bleed
 SPECTRAL_FLAT_TH = 0.55      # spectral flatness above this → broadband (gunshot-like)
 
@@ -161,11 +162,28 @@ class EventDetector:
         }
         self.recent_foot_times: List[float] = []
         self.last_shot_time: float = -1.0  # sentinel: no shot has occurred yet
+        self.last_shot_suppress: float = SHOT_SUPPRESS_MIN  # adaptive suppression duration
         # Lower K -> more sensitive; scale Ks by 1/sensitivity
         s = max(sensitivity, 1e-3)
         self.k_fa = TH_K_FA / s
         self.k_fb = TH_K_FB / s
         self.k_g  = TH_K_G  / s
+
+        # Persistent filter states — carry IIR state across frames so filters
+        # don't restart from zero every 20ms (fixes Band A underestimation for
+        # low-frequency footstep components that need multiple cycles to ring up)
+        self._zi = {
+            'FA_L': np.zeros((SOS_FA.shape[0], 2)),
+            'FA_R': np.zeros((SOS_FA.shape[0], 2)),
+            'FB_L': np.zeros((SOS_FB.shape[0], 2)),
+            'FB_R': np.zeros((SOS_FB.shape[0], 2)),
+            'FP_L': np.zeros((SOS_FP.shape[0], 2)),
+            'FP_R': np.zeros((SOS_FP.shape[0], 2)),
+            'G1_L': np.zeros((SOS_G1.shape[0], 2)),
+            'G1_R': np.zeros((SOS_G1.shape[0], 2)),
+            'G2_L': np.zeros((SOS_G2.shape[0], 2)),
+            'G2_R': np.zeros((SOS_G2.shape[0], 2)),
+        }
 
     def _dir_from_lr(self, srcL, srcR):
         tau, cc = gcc_phat(srcL, srcR)
@@ -185,22 +203,36 @@ class EventDetector:
         ari = np.mean(arr)
         return float(geo / (ari + EPS))
 
+    def _filt(self, sos, x, key):
+        """Apply IIR filter with persistent state across frames."""
+        y, self._zi[key] = sosfilt(sos, x, zi=self._zi[key])
+        return y
+
     def detect(self, frame_lr: np.ndarray) -> Optional[AudioEvent]:
         L, R = frame_lr[:,0], frame_lr[:,1]
 
-        # Bandpass
-        FA_L, FA_R = sosfilt(SOS_FA, L), sosfilt(SOS_FA, R)
-        FB_L, FB_R = sosfilt(SOS_FB, L), sosfilt(SOS_FB, R)
-        FP_L, FP_R = sosfilt(SOS_FP, L), sosfilt(SOS_FP, R)   # 2 kHz peak sub-band
-        G1_L, G1_R = sosfilt(SOS_G1, L), sosfilt(SOS_G1, R)
-        G2_L, G2_R = sosfilt(SOS_G2, L), sosfilt(SOS_G2, R)
+        # Bandpass with persistent filter state (avoids IIR ring-up transient each frame)
+        FA_L = self._filt(SOS_FA, L, 'FA_L')
+        FA_R = self._filt(SOS_FA, R, 'FA_R')
+        FB_L = self._filt(SOS_FB, L, 'FB_L')
+        FB_R = self._filt(SOS_FB, R, 'FB_R')
+        FP_L = self._filt(SOS_FP, L, 'FP_L')
+        FP_R = self._filt(SOS_FP, R, 'FP_R')
+        G1_L = self._filt(SOS_G1, L, 'G1_L')
+        G1_R = self._filt(SOS_G1, R, 'G1_R')
+        G2_L = self._filt(SOS_G2, L, 'G2_L')
+        G2_R = self._filt(SOS_G2, R, 'G2_R')
 
         # Energies
         e_FA = ste(np.hstack((FA_L, FA_R)))
         e_FB = ste(np.hstack((FB_L, FB_R)))
         e_FP = ste(np.hstack((FP_L, FP_R)))   # footstep peak sub-band energy
-        e_G  = ste(np.hstack((G1_L+G2_L, G1_R+G2_R)))
-        cf   = crest(np.hstack((L, R)))
+        gun_combined = np.hstack((G1_L+G2_L, G1_R+G2_R))
+        e_G  = ste(gun_combined)
+        # Crest factor on gun-band signal only — not the raw mix.
+        # Raw mix includes music/ambient/UI that inflates RMS and suppresses
+        # crest, causing distant gunshots to miss the threshold in-game.
+        cf   = crest(gun_combined)
 
         # Update adaptive floors
         self.stats['FA'].update(e_FA)
@@ -233,10 +265,12 @@ class EventDetector:
             # Slightly lower confidence for soft-shot detections
             if soft_shot:
                 confidence *= 0.8
+            # Adaptive suppression: louder shots get longer suppression (more reverb)
+            self.last_shot_suppress = SHOT_SUPPRESS_MIN + (SHOT_SUPPRESS_MAX - SHOT_SUPPRESS_MIN) * intensity
             return AudioEvent('shot', theta, intensity, confidence, now)
 
         # --- Post-shot suppression: ignore footstep candidates shortly after a shot ---
-        if (now - self.last_shot_time) < SHOT_SUPPRESS_S:
+        if (now - self.last_shot_time) < self.last_shot_suppress:
             return None
 
         # --- Footstep candidate gate ---
