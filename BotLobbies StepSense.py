@@ -972,6 +972,7 @@ class AudioLoop:
 def build_parser():
     p = argparse.ArgumentParser(description="Audio→Visual Compass (COD/Warzone) — No Haptics")
     p.add_argument("--device", type=int, default=None, help="WASAPI output device index to loopback-capture (see --list-devices)")
+    p.add_argument("--file", type=str, default=None, help="Play a WAV file through the detector instead of live capture")
     p.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
     p.add_argument("--list-outputs", action="store_true", help="List only output devices and exit")
     p.add_argument("--choose-device", action="store_true", help="Interactively list devices and prompt for selection, then start")
@@ -1051,10 +1052,11 @@ def choose_device_interactive() -> Optional[int]:
         return None
     return idx
 
-def make_on_frame(detector, state, args):
-    """Build the per-frame audio callback. Shared by --choose-device and normal paths."""
-    def on_frame(frame_lr):
-        evt = detector.detect(frame_lr)
+def make_on_frame(detector, state, args, use_file_time=False):
+    """Build the per-frame audio callback. Shared by --choose-device, normal, and --file paths."""
+    def on_frame(frame_lr, file_time=None):
+        t = file_time if use_file_time else None
+        evt = detector.detect(frame_lr, t=t)
         if args.debug_audio:
             # Lightweight RMS meter every ~0.5s
             if not hasattr(on_frame, "_acc"):
@@ -1070,6 +1072,86 @@ def make_on_frame(detector, state, args):
             state.push(evt)
             logging.debug(f"{evt.cls:8s} az={math.degrees(evt.theta):+05.1f}° I={evt.intensity:.2f} C={evt.confidence:.2f}")
     return on_frame
+
+
+class FilePlayback:
+    """Feed a WAV file through the detector at real-time speed for overlay testing."""
+
+    def __init__(self, file_path: str, fs=FS, hop=HOP, win=WIN):
+        import wave
+        from scipy.signal import resample_poly
+
+        w = wave.open(file_path, 'r')
+        n_ch = w.getnchannels()
+        sw = w.getsampwidth()
+        wav_fs = w.getframerate()
+        n_frames = w.getnframes()
+        raw = w.readframes(n_frames)
+        w.close()
+
+        # Convert to float32
+        if sw == 2:
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sw == 4:
+            samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+
+        samples = samples.reshape(-1, n_ch)
+        if n_ch == 1:
+            samples = np.repeat(samples, 2, axis=1)
+        elif n_ch > 2:
+            samples = samples[:, :2]
+
+        # Resample to target rate if needed
+        if wav_fs != fs:
+            from math import gcd
+            g = gcd(fs, wav_fs)
+            up, down = fs // g, wav_fs // g
+            samples = np.column_stack([
+                resample_poly(samples[:, 0], up, down),
+                resample_poly(samples[:, 1], up, down)
+            ]).astype(np.float32)
+            logging.info("Resampled %d Hz -> %d Hz (%d -> %d samples)", wav_fs, fs, n_frames, len(samples))
+
+        self.samples = samples
+        self.fs = fs
+        self.hop = hop
+        self.win = win
+        self.duration = len(samples) / fs
+        self.stop_flag = threading.Event()
+        self.worker_thread = None
+        logging.info("Loaded %s: %.2fs, %d samples at %d Hz", file_path, self.duration, len(samples), fs)
+
+    def start(self, on_frame):
+        """Feed frames at real-time speed in a background thread."""
+        def worker():
+            t_start = time.monotonic()
+            for i in range(0, len(self.samples) - self.win, self.hop):
+                if self.stop_flag.is_set():
+                    break
+                frame = self.samples[i:i+self.win]
+                file_time = i / self.fs
+
+                # Pace to real-time: wait until we should be at this point
+                target = t_start + file_time
+                now = time.monotonic()
+                if target > now:
+                    time.sleep(target - now)
+
+                on_frame(frame, file_time=file_time)
+
+            # Keep running briefly so the last markers can decay visually
+            time.sleep(1.0)
+            logging.info("File playback complete")
+
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
+
+    def stop(self):
+        self.stop_flag.set()
+        if self.worker_thread:
+            self.worker_thread.join(timeout=2.0)
 
 def run_event_loop(audio, state, args):
     """Run the overlay (or headless) event loop, then clean up audio on exit."""
@@ -1105,6 +1187,17 @@ def main():
         return
     if args.list_devices:
         list_devices()
+        return
+
+    # --- File playback mode ---
+    if args.file:
+        detector = EventDetector(sensitivity=args.sensitivity)
+        state = EventState()
+        on_frame = make_on_frame(detector, state, args, use_file_time=True)
+        playback = FilePlayback(args.file)
+        playback.start(on_frame)
+        print("Playing %s (%.1fs)... overlay will show detections in real-time." % (args.file, playback.duration))
+        run_event_loop(playback, state, args)
         return
 
     if args.choose_device:
