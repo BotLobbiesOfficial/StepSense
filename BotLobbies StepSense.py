@@ -76,6 +76,11 @@ SHOT_SUPPRESS_MAX = 0.35     # maximum suppression for loud/close shots (350 ms,
 GUN_FOOT_RATIO   = 3.0       # if gunshot-band energy ≥ 3× footstep-band → reject as gunfire bleed
 SPECTRAL_FLAT_TH = 0.55      # spectral flatness above this → broadband (gunshot-like)
 
+# De-duplication: minimum time between emitting the same event type.
+# Prevents the same footstep/shot from triggering on consecutive 10ms frames.
+FOOT_RETRIGGER = 0.08        # 80 ms — a single footstep impact lasts ~120-170ms
+SHOT_RETRIGGER = 0.05        # 50 ms — shots are sharper transients
+
 # Cadence (seconds between steps) — covers tac-sprint (~200ms) through slow walk/ADS (~600ms)
 # Source: biomechanics data mapped to CoD movement speeds
 # Tac-sprint: ~200-280ms | Sprint: ~250-333ms | Run: ~375-430ms | Walk/ADS: ~500-600ms
@@ -162,6 +167,7 @@ class EventDetector:
         }
         self.recent_foot_times: List[float] = []
         self.last_shot_time: float = -1.0  # sentinel: no shot has occurred yet
+        self.last_foot_time: float = -1.0  # for footstep de-duplication
         self.last_shot_suppress: float = SHOT_SUPPRESS_MIN  # adaptive suppression duration
         # Lower K -> more sensitive; scale Ks by 1/sensitivity
         s = max(sensitivity, 1e-3)
@@ -208,7 +214,13 @@ class EventDetector:
         y, self._zi[key] = sosfilt(sos, x, zi=self._zi[key])
         return y
 
-    def detect(self, frame_lr: np.ndarray) -> Optional[AudioEvent]:
+    def detect(self, frame_lr: np.ndarray, t: Optional[float] = None) -> Optional[AudioEvent]:
+        """Detect audio events in a stereo frame.
+        Args:
+            frame_lr: (WIN, 2) numpy array of stereo audio samples.
+            t: Optional timestamp in seconds. If None, uses time.monotonic().
+               Pass file-position timestamps for offline/file-based processing.
+        """
         L, R = frame_lr[:,0], frame_lr[:,1]
 
         # Bandpass with persistent filter state (avoids IIR ring-up transient each frame)
@@ -244,7 +256,7 @@ class EventDetector:
         th_FB = self.stats['FB'].mu + self.k_fb * self.stats['FB'].sigma
         th_G  = self.stats['G' ].mu + self.k_g  * self.stats['G' ].sigma
 
-        now = time.monotonic()
+        now = t if t is not None else time.monotonic()
 
         # --- Shot detection (two-tier: hard and soft crest thresholds) ---
         hard_shot = (e_G > th_G) and (cf >= CREST_SHOT_HARD)
@@ -254,13 +266,16 @@ class EventDetector:
         sf = self._spectral_flatness([e_FA, e_FB, e_G])
 
         if hard_shot or (soft_shot and sf > SPECTRAL_FLAT_TH):
+            # De-duplicate: don't re-fire if we just emitted a shot on an adjacent frame
+            if (now - self.last_shot_time) < SHOT_RETRIGGER:
+                return None
             self.last_shot_time = now
             # Clear cadence history — shot reverb contaminates step timing
             self.recent_foot_times.clear()
 
             srcL, srcR = (G1_L+G2_L), (G1_R+G2_R)
             theta, conf_dir = self._dir_from_lr(srcL, srcR)
-            intensity = float(min(1.0, math.sqrt(e_G) * 60))
+            intensity = float(np.clip(math.sqrt(e_G) * 20, 0.0, 1.0))
             confidence = float(np.clip((conf_dir*0.6) + 0.4, 0.0, 1.0))
             # Slightly lower confidence for soft-shot detections
             if soft_shot:
@@ -271,6 +286,10 @@ class EventDetector:
 
         # --- Post-shot suppression: ignore footstep candidates shortly after a shot ---
         if (now - self.last_shot_time) < self.last_shot_suppress:
+            return None
+
+        # --- Footstep de-duplication: same footstep spans multiple 10ms frames ---
+        if (now - self.last_foot_time) < FOOT_RETRIGGER:
             return None
 
         # --- Footstep candidate gate ---
@@ -318,7 +337,7 @@ class EventDetector:
             conf_cad = 0.25*(1.0 if good1 else 0.0) + 0.25*(1.0 if good2 else 0.0)
 
         e_foot = 0.4 * e_FA + 0.6 * e_FB
-        intensity = float(np.clip(np.sqrt(e_foot) * 70, 0.0, 1.0))
+        intensity = float(np.clip(np.sqrt(e_foot) * 20, 0.0, 1.0))
         # Per-band excess ratios — clamp each to [0,1] individually so a non-triggering
         # band doesn't subtract from confidence (fixes metal/concrete footsteps weak in Band A)
         excess_a = float(np.clip((e_FA - th_FA) / (th_FA + EPS), 0, 1))
@@ -331,8 +350,8 @@ class EventDetector:
 
         confidence = float(np.clip(0.45*conf_base + 0.25*conf_dir + conf_peak + conf_cad, 0.0, 1.0))
 
-        # Record this footstep in cadence history AFTER computing confidence,
-        # so only emitted events influence future cadence scoring
+        # Record this footstep for cadence and de-duplication
+        self.last_foot_time = now
         self.recent_foot_times.append(now)
         if len(self.recent_foot_times) > 12:
             self.recent_foot_times = self.recent_foot_times[-12:]
