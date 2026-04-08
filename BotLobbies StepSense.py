@@ -49,7 +49,11 @@ FS = 48000                # sample rate
 HOP = 480                 # 10 ms hop
 WIN = 960                 # 20 ms window
 EPS = 1e-12
-EAR_DIST = 0.18           # ~18 cm ear spacing
+# Virtual ear spacing for game audio direction estimation.
+# Real ears are ~18cm apart, but game stereo panning uses much more aggressive
+# L/R differences than physical acoustics. A smaller virtual distance amplifies
+# the angular response so game panning maps to wider compass angles.
+EAR_DIST = 0.04           # ~4 cm virtual spacing (tuned for game stereo)
 SPEED_SOUND = 343.0
 
 # Bands (Warzone / Black Ops tuned from community spectral analysis)
@@ -195,8 +199,9 @@ class EventDetector:
         tau = float(np.clip(tau, -EAR_DIST/SPEED_SOUND, EAR_DIST/SPEED_SOUND))
         theta_itd = math.asin((SPEED_SOUND * tau) / EAR_DIST)
         ild = 20*math.log10((math.sqrt(ste(srcR))+EPS)/(math.sqrt(ste(srcL))+EPS))
-        theta_ild = math.radians(np.clip(ild * 3.0, -90, 90))  # crude ILD→angle slope
-        theta = 0.65*theta_itd + 0.35*theta_ild
+        # Game stereo: 6 dB L/R difference ≈ 54° angle (9.0 multiplier)
+        theta_ild = math.radians(np.clip(ild * 9.0, -90, 90))
+        theta = 0.5*theta_itd + 0.5*theta_ild
         conf_dir = float(np.clip(cc/8.0, 0.0, 1.0))
         return theta, conf_dir
 
