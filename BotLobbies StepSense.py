@@ -26,7 +26,7 @@ from typing import List, Optional
 
 import numpy as np
 import sounddevice as sd
-from scipy.signal import butter, sosfilt
+from scipy.signal import butter, sosfilt, resample_poly
 
 # Windows-specific audio capture (PyAudioWPatch for WASAPI loopback)
 try:
@@ -127,9 +127,8 @@ def gcc_phat(x, y, fs=FS, interp=4):
     max_shift = int(len(x)*interp//2)
     cc = np.concatenate((cc[-max_shift:], cc[:max_shift+1]))
     idx = int(np.argmax(cc))
-    peak = cc[idx]
     tau = (idx - max_shift) / (fs * interp)
-    conf = float((peak - np.mean(cc)) / (np.std(cc) + EPS))
+    conf = float((cc[idx] - np.mean(cc)) / (np.std(cc) + EPS))
     return tau, conf
 
 class RollingStats:
@@ -556,7 +555,10 @@ if WINDOWS_AUDIO_AVAILABLE:
                 audio_data = np.frombuffer(in_data, dtype=np.float32)
 
                 # Reshape based on channels (handle mono, stereo, and surround)
-                n_channels = len(audio_data) // frame_count if frame_count > 0 else 1
+                if frame_count > 0 and len(audio_data) % frame_count == 0:
+                    n_channels = len(audio_data) // frame_count
+                else:
+                    n_channels = 1
                 if n_channels <= 1:
                     # Mono - duplicate to stereo
                     audio_data = np.repeat(audio_data.reshape(-1, 1), 2, axis=1)
@@ -873,7 +875,9 @@ class AudioLoop:
                                     kind = "loopback" if can_use_loopback else "input"
                                     logging.info("Opened %s on device %s '%s' via %s (exclusive=%s) at %d Hz, blocksize=%s, with %d ch%s",
                                                  kind, str(device_idx), d['name'], ha, exclusive, sr, str(bs), ch,
-                                                 " (duplicated to stereo)" if ch == 1 else "")
+                                                 " (duplicated to stereo — NO directional info)" if ch == 1 else "")
+                                    if ch == 1:
+                                        logging.warning("Mono capture: all detections will show CENTER direction. Use a stereo device for directional info.")
                                 except Exception:
                                     logging.info("Opened device %s (exclusive=%s) at %d Hz, blocksize=%s, with %d ch",
                                                  str(device_idx), exclusive, sr, str(bs), ch)
@@ -970,8 +974,11 @@ class AudioLoop:
     def stop(self):
         self.stop_flag.set()
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
         if self.worker_thread:
             self.worker_thread.join(timeout=1.0)
         if self.windows_capture:
@@ -1091,7 +1098,6 @@ class FilePlayback:
 
     def __init__(self, file_path: str, fs=FS, hop=HOP, win=WIN):
         import wave
-        from scipy.signal import resample_poly
 
         w = wave.open(file_path, 'r')
         n_ch = w.getnchannels()
@@ -1104,6 +1110,15 @@ class FilePlayback:
         # Convert to float32
         if sw == 2:
             samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sw == 3:
+            # 24-bit: pad each 3-byte sample to 4 bytes, then read as int32
+            raw_bytes = np.frombuffer(raw, dtype=np.uint8)
+            n_samples = len(raw_bytes) // 3
+            padded = np.zeros(n_samples * 4, dtype=np.uint8)
+            padded[1::4] = raw_bytes[0::3]
+            padded[2::4] = raw_bytes[1::3]
+            padded[3::4] = raw_bytes[2::3]
+            samples = padded.view(np.int32).astype(np.float32) / 2147483648.0
         elif sw == 4:
             samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
         else:
@@ -1117,8 +1132,7 @@ class FilePlayback:
 
         # Resample to target rate if needed
         if wav_fs != fs:
-            from math import gcd
-            g = gcd(fs, wav_fs)
+            g = math.gcd(fs, wav_fs)
             up, down = fs // g, wav_fs // g
             samples = np.column_stack([
                 resample_poly(samples[:, 0], up, down),
