@@ -935,8 +935,11 @@ class AudioLoop:
                 logging.warning("Primary device failed; trying default WASAPI output device index %s", dev_default)
                 opened = try_open_on_device(dev_default)
 
+            # Try pyaudiowpatch WASAPI loopback first — it targets the specific device
+            # and works with USB headphones. Stereo Mix is last resort since it only
+            # captures from the default onboard sound card, not USB devices.
             if not opened:
-                opened = try_stereo_mix() or try_windows_capture(on_frame)
+                opened = try_windows_capture(on_frame) or try_stereo_mix()
 
             if not opened:
                 raise RuntimeError("Failed to open a loopback stream on the selected device. "
