@@ -383,9 +383,10 @@ class EventState:
     def push(self, evt: AudioEvent):
         with self.lock:
             decay = SHOT_DECAY if evt.cls == 'shot' else FOOT_DECAY
-            self.markers.append(Marker(evt.cls, evt.theta, evt.intensity, evt.confidence, evt.t, decay))
-            # Keep only recent
+            # Always use wall-clock time for display decay, not the detector's
+            # logical timestamp (which may be file-position in --file mode)
             now = time.monotonic()
+            self.markers.append(Marker(evt.cls, evt.theta, evt.intensity, evt.confidence, now, decay))
             self.markers = [m for m in self.markers if m.alpha(now) > 0.02]
 
     def get_markers(self) -> List[Marker]:
@@ -419,37 +420,48 @@ if PYSIDE:
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
             rect = self.rect()
             cx, cy = rect.center().x(), rect.center().y()
-            radius = min(rect.width(), rect.height())//2 - 20
+            # Compass ring sized to ~1/3 of the shorter screen dimension
+            radius = min(rect.width(), rect.height()) // 6
 
             # Outer ring
-            pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 80), 2)
+            pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 140), 2)
             painter.setPen(pen)
             painter.setBrush(QtCore.Qt.NoBrush)
             painter.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
 
-            # 0° marker (front)
-            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 120), 3))
-            painter.drawLine(cx, cy - radius, cx, cy - radius + 20)
+            # Cardinal markers (front/back/left/right)
+            marker_len = 12
+            for angle, label in [(0, "F"), (180, "B"), (90, "R"), (270, "L")]:
+                rad = math.radians(angle)
+                ox = cx + radius * math.sin(rad)
+                oy = cy - radius * math.cos(rad)
+                ix = cx + (radius - marker_len) * math.sin(rad)
+                iy = cy - (radius - marker_len) * math.cos(rad)
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 180), 2))
+                painter.drawLine(QtCore.QPointF(ox, oy), QtCore.QPointF(ix, iy))
 
-            # Draw markers
+            # Draw event markers
             now = time.monotonic()
+            tick_len = max(30, radius // 4)
             for m in self.state.get_markers():
                 alpha = int(255 * m.alpha(now))
                 if alpha <= 0:
                     continue
-                color = QtGui.QColor(80, 200, 255, alpha) if m.cls == 'footstep' else QtGui.QColor(255, 120, 80, alpha)
-                painter.setPen(QtGui.QPen(color, 6 if m.cls == 'shot' else 4))
-                # location on ring edge (0° at top)
-                ax = cx + radius * math.sin(m.theta)
-                ay = cy - radius * math.cos(m.theta)
-                # tick
-                painter.drawLine(QtCore.QPointF(ax, ay),
-                                 QtCore.QPointF(cx + (radius-25) * math.sin(m.theta),
-                                                cy - (radius-25) * math.cos(m.theta)))
-                # short arc tail
-                painter.setPen(QtGui.QPen(color, 2))
+                is_foot = m.cls == 'footstep'
+                color = QtGui.QColor(80, 220, 255, alpha) if is_foot else QtGui.QColor(255, 100, 60, alpha)
+                pen_w = 5 if is_foot else 8
+                painter.setPen(QtGui.QPen(color, pen_w))
+                # Tick from ring edge inward
+                ox = cx + radius * math.sin(m.theta)
+                oy = cy - radius * math.cos(m.theta)
+                ix = cx + (radius - tick_len) * math.sin(m.theta)
+                iy = cy - (radius - tick_len) * math.cos(m.theta)
+                painter.drawLine(QtCore.QPointF(ox, oy), QtCore.QPointF(ix, iy))
+                # Arc span
+                arc_span = 16 if is_foot else 24
+                painter.setPen(QtGui.QPen(color, 3))
                 painter.drawArc(int(cx-radius), int(cy-radius), int(2*radius), int(2*radius),
-                                int((90 - math.degrees(m.theta) - 6) * 16), int(12 * 16))
+                                int((90 - math.degrees(m.theta) - arc_span/2) * 16), int(arc_span * 16))
             painter.end()
 
 # =========================
