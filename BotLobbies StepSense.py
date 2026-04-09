@@ -93,8 +93,8 @@ CAD_MAX = 0.60
 
 # UI
 UI_FPS = 60
-SHOT_DECAY = 0.25
-FOOT_DECAY = 0.45
+SHOT_DECAY = 0.6             # how long shot markers stay visible (seconds)
+FOOT_DECAY = 1.0             # how long footstep markers stay visible (seconds)
 
 # =========================
 #     DSP HELPERS
@@ -424,8 +424,8 @@ if PYSIDE:
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
             rect = self.rect()
             cx, cy = rect.center().x(), rect.center().y()
-            # Compass ring sized to ~1/3 of the shorter screen dimension
-            radius = min(rect.width(), rect.height()) // 6
+            # Compass ring sized to ~1/4 of the shorter screen dimension
+            radius = min(rect.width(), rect.height()) // 4
 
             # Outer ring
             pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 140), 2)
@@ -433,27 +433,34 @@ if PYSIDE:
             painter.setBrush(QtCore.Qt.NoBrush)
             painter.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
 
-            # Cardinal markers (front/back/left/right)
-            marker_len = 12
+            # Cardinal markers with labels
+            font = painter.font()
+            font.setPixelSize(max(14, radius // 10))
+            font.setBold(True)
+            painter.setFont(font)
             for angle, label in [(0, "F"), (180, "B"), (90, "R"), (270, "L")]:
                 rad = math.radians(angle)
                 ox = cx + radius * math.sin(rad)
                 oy = cy - radius * math.cos(rad)
-                ix = cx + (radius - marker_len) * math.sin(rad)
-                iy = cy - (radius - marker_len) * math.cos(rad)
-                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 180), 2))
+                ix = cx + (radius - 15) * math.sin(rad)
+                iy = cy - (radius - 15) * math.cos(rad)
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 200), 2))
                 painter.drawLine(QtCore.QPointF(ox, oy), QtCore.QPointF(ix, iy))
+                # Label outside ring
+                lx = cx + (radius + 18) * math.sin(rad) - 6
+                ly = cy - (radius + 18) * math.cos(rad) + 6
+                painter.drawText(QtCore.QPointF(lx, ly), label)
 
             # Draw event markers
             now = time.monotonic()
-            tick_len = max(30, radius // 4)
+            tick_len = max(40, radius // 3)
             for m in self.state.get_markers():
                 alpha = int(255 * m.alpha(now))
                 if alpha <= 0:
                     continue
                 is_foot = m.cls == 'footstep'
                 color = QtGui.QColor(80, 220, 255, alpha) if is_foot else QtGui.QColor(255, 100, 60, alpha)
-                pen_w = 5 if is_foot else 8
+                pen_w = 6 if is_foot else 10
                 painter.setPen(QtGui.QPen(color, pen_w))
                 # Tick from ring edge inward
                 ox = cx + radius * math.sin(m.theta)
@@ -461,8 +468,14 @@ if PYSIDE:
                 ix = cx + (radius - tick_len) * math.sin(m.theta)
                 iy = cy - (radius - tick_len) * math.cos(m.theta)
                 painter.drawLine(QtCore.QPointF(ox, oy), QtCore.QPointF(ix, iy))
+                # Filled dot at ring edge for visibility
+                dot_r = 6 if is_foot else 9
+                painter.setBrush(QtGui.QBrush(color))
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.drawEllipse(QtCore.QPointF(ox, oy), dot_r, dot_r)
+                painter.setBrush(QtCore.Qt.NoBrush)
                 # Arc span
-                arc_span = 16 if is_foot else 24
+                arc_span = 20 if is_foot else 30
                 painter.setPen(QtGui.QPen(color, 3))
                 painter.drawArc(int(cx-radius), int(cy-radius), int(2*radius), int(2*radius),
                                 int((90 - math.degrees(m.theta) - arc_span/2) * 16), int(arc_span * 16))
